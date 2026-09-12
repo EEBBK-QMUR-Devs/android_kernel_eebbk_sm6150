@@ -231,6 +231,21 @@ SECTIONS
 
 	BSS_SECTION(0, 0, 0)
 
+	/*
+	 * EEBBK/BBK RTIC data (__rticdata -> .bss.rtic, contains selinux_state).
+	 *
+	 * It must live INSIDE the kernel image (before _end): the kernel only
+	 * reserves _text.._end, so data placed after _end gets handed out by the
+	 * page allocator and any write to it corrupts selinux_state.
+	 *
+	 * It also must be emitted before the zero-address debug sections
+	 * (STABS_DEBUG) and must not be a second ".bss" output section - both
+	 * make the location counter/linker place it outside .text's ADRP range.
+	 */
+	.bss.rtic : {			/* RTIC bss segment	*/
+		RTIC_BSS
+	}
+
 	. = ALIGN(PAGE_SIZE);
 	idmap_pg_dir = .;
 	. += IDMAP_DIR_SIZE;
@@ -253,10 +268,6 @@ SECTIONS
 	STABS_DEBUG
 
 	HEAD_SYMBOLS
-
-	.bss : {			/* bss segment		*/
-         RTIC_BSS
-	}
 }
 
 /*
