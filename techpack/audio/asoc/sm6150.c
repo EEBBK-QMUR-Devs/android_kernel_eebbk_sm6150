@@ -8555,16 +8555,38 @@ static struct snd_soc_card *populate_snd_card_dailinks(struct device *dev)
 				__func__);
 		} else {
 			if (mi2s_audio_intf) {
-
-    // 第一个 link（通常是左声道）
-                msm_mi2s_be_dai_links[0].codec_name = "tfa98xx.2-0034";
-                msm_mi2s_be_dai_links[0].codec_dai_name = "tfa98xx-aif-2-34";
-
-                // 第二个 link（右声道）
-                msm_mi2s_be_dai_links[1].codec_name = "tfa98xx.2-0036";
-                msm_mi2s_be_dai_links[1].codec_dai_name = "tfa98xx-aif-2-36";
-
-                dev_info(dev, "%s: dual speaker configured (34 & 36)\n", __func__);
+				/*
+				 * EEBBK S6 (P20H130 / sdmmagpiep): the two speaker
+				 * amplifiers on i2c 2-0034 and 2-0036 are AWINIC
+				 * AW882xx parts, not TFA98xx.  The aw882xx driver
+				 * probes both (dmesg: "[Awinic][2-0034]aw882xx
+				 * 1852 detected") and registers the DAIs
+				 * "aw882xx-aif-2-34" / "aw882xx-aif-2-36" with the
+				 * components "aw882xx_smartpa.2-0034" /
+				 * "aw882xx_smartpa.2-0036".
+				 *
+				 * The previous code forced the legacy single-codec
+				 * fields to "tfa98xx*" here.  That makes
+				 * snd_soc_init_multicodec() collapse each link to one
+				 * codec (num_codecs = 1) pointing at a DAI that does
+				 * not exist on this board, so
+				 * snd_soc_register_card() returns -EPROBE_DEFER
+				 * forever:
+				 *   "ASoC: CODEC DAI tfa98xx-aif-2-34 not registered"
+				 * No sound card is ever created, the vendor audio HAL
+				 * dies in get_sndcard_id(), audioserver never
+				 * publishes media.audio_policy and the device hangs on
+				 * the boot animation.
+				 *
+				 * Leave the legacy fields NULL and let the link table
+				 * above supply the AW882xx components
+				 * (.codecs = awinic_codecs, .num_codecs = 2 under
+				 * CONFIG_SND_SOC_AWINIC_AW882XX) - this is what the
+				 * factory machine_dlkm.ko does (its symbol table has
+				 * "aw882xx_dails", 48 bytes = 2 dai_link_components).
+				 */
+				dev_info(dev, "%s: dual AW882xx speakers configured (2-0034 & 2-0036)\n",
+					 __func__);
 
 				memcpy(msm_sm6150_dai_links + total_links,
 					msm_mi2s_be_dai_links,
