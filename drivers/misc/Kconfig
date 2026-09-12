@@ -628,3 +628,13 @@ config OKL4_LINK_SHBUF
 	      transport. This driver presents the link to Linux as a character device
 	      which can be written to or read from to access the shared memory. An ioctl
 	      on the device is used to send a virtual interrupt to the partner cell.
+config VIB_PWM
+	tristate "BBK elevator camera motor controller"
+	depends on OF && GPIOLIB
+	help
+	  Say Y here to support the BBK elevator motor that pushes the front camera
+	  of the EEBBK S6 out of the body (dt: bbk,vib_pwm_control).  The driver is
+	  reconstructed from the vendor kernel binary because the vendor sources are
+	  not part of this tree.
+
+

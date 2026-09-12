@@ -1,0 +1,911 @@
+/*
+ * BBK elevator camera motor controller for the EEBBK S6 (P20H130).
+ *
+ * The front camera of this device sits on a motorised elevator: it is pushed
+ * out of the body when the camera application starts and retracted again
+ * afterwards.  The controller driver is called vib_pwm in the factory kernel
+ * and its source is not part of this tree, so the device tree bindings, the
+ * sysfs interface and the motor timing were recovered from the factory boot
+ * image and its device tree.
+ *
+ * Hardware (from the factory device tree, node soc:bbk_vib_pwm)
+ *   compatible = "bbk,vib_pwm_control"
+ *   boost-gpio  GPIO24   driver supply boost converter, high while moving
+ *   enable-gpio GPIO23   driver enable, pulled low while moving
+ *   sleep-gpio  GPIO29   driver nSLEEP, high while moving
+ *   dir-gpio    GPIO26   0 moves the elevator up, 1 moves it down
+ *   id-gpio     GPIO25   elevator module id strap, read through a pull-up
+ *   clocks = <&gcc GCC_GP2_CLK>, clock-names = "gp2_clk"
+ *
+ * There is no pwm controller: the drive waveform is the general purpose clock
+ * gcc_gp2_clk, which the "vib_pwm_active" pinctrl state routes out on gpio21,
+ * so the chopper frequency is simply the clock rate.  gcc_gp2_clk_src is a
+ * fractional (mnd) rcg, so a 32 kHz rate is synthesizable even though the
+ * preset table only lists 19.2, 25, 50, 100 and 200 MHz.
+ *
+ * Recovered from the factory binary (symbols are still in its kallsyms)
+ *   vib_pwm_probe, vib_pwm_set_camera, vib_pwm_set_camera_state,
+ *   vib_pwm_state_move_sate, vib_pwm_camera_state_show/store, the fifteen
+ *   dev_attr_vib_pwm_* attributes, get_camera_state, cancel_vib_hrtimer,
+ *   set_vib_all_time, set_vib_up_down_count, is_top_or_bottom,
+ *   computer_distance, vib_is_in_cali, vib_is_move.
+ *
+ * Private data layout of the vendor driver, as far as it could be recovered
+ * (offset : meaning), kept here because the sysfs handlers and the state
+ * machine both address it by offset:
+ *   +16  boost gpio        +20  enable gpio      +24  sleep gpio
+ *   +28  dir gpio          +32  id gpio          +72  struct clk *gp2_clk
+ *   +152 struct wakeup_source (the driver calls __pm_stay_awake on it)
+ *   +344 ktime_t of the current move (nanoseconds, for the hrtimer)
+ *   +352 unsigned int time, the move duration in milliseconds
+ *   +356 int tick, 50 when the move is run in fixed ticks
+ *   +360 u8 use_tick, set when time > 65536
+ *   +400 unsigned long freq, the clock rate handed to clk_set_rate
+ *   +412 int motor, 1 moves up, 2 moves down, anything else stops
+ *   +416 int camera_state, the value vib_pwm_camera_state reports
+ *   +472 unsigned int count, incremented once per started move
+ *   +540 int is_in_cali
+ *
+ * The vendor sequence for one move, replicated here instruction for
+ * instruction, is
+ *   clk_set_rate(gp2_clk, freq)      (the vendor programs 32000 for every move)
+ *   bbk_hall_core_enable(0)
+ *   clk_prepare(gp2_clk)
+ *   gpio dir = 0 for up, 1 for down
+ *   gpio boost = 1
+ *   msleep(3)
+ *   gpio enable = 0
+ *   gpio sleep = 1
+ *   msleep(3)
+ *   clk_enable(gp2_clk)
+ *   hrtimer_start(&timer, move_time, HRTIMER_MODE_REL_PINNED)
+ *   bbk_hall_core_enable(1)
+ * and to stop it
+ *   gpio boost = 0
+ *   msleep(5)
+ *   gpio enable = 1
+ *   gpio sleep = 0
+ *   clk_disable_unprepare(gp2_clk)
+ *
+ * SPDX-License-Identifier: GPL-2.0
+ */
+#include <linux/module.h>
+#include <linux/platform_device.h>
+#include <linux/of.h>
+#include <linux/of_gpio.h>
+#include <linux/gpio.h>
+#include <linux/clk.h>
+#include <linux/pinctrl/consumer.h>
+#include <linux/hrtimer.h>
+#include <linux/ktime.h>
+#include <linux/delay.h>
+#include <linux/slab.h>
+#include <linux/mutex.h>
+#include <linux/sysfs.h>
+#include <linux/pm_wakeup.h>
+#include <linux/uaccess.h>
+
+#define VIB_PWM_DRV_NAME	"bbk_vib_pwm"
+
+/* camera_state values, as the vendor reports them */
+#define CAM_STATE_DOWN		0	/* retracted */
+#define CAM_STATE_UP		1	/* raised */
+#define CAM_STATE_UP_TILT	2	/* raised and tilted */
+#define CAM_STATE_BUSY_UP	4	/* moving up */
+#define CAM_STATE_BUSY_DOWN	5	/* moving down */
+
+/* the vendor's per-move chopper frequency and its tick period */
+#define VIB_PWM_DEFAULT_FREQ	32000
+#define VIB_PWM_TICK_MS		50
+#define VIB_PWM_TICK_LIMIT	65536
+#define VIB_PWM_TIME_MAGIC	1300	/* writing this uses the parameter below */
+#define VIB_PWM_MOVE_RATIO_NUM	6	/* move_time = 6 * time / 10 */
+#define VIB_PWM_MOVE_RATIO_DEN	10
+
+/*
+ * Move durations used when userspace has not set one through vib_pwm_time.
+ * [RE] the vendor derives the raise duration as "696 + parameter / 1000" so
+ * 696 ms is its base value, and the probe leaves the same 696 in the field.
+ * The extra stages are calibration values that live in the vendor's module
+ * parameters, they can all be overridden by writing vib_pwm_time.
+ */
+#define VIB_PWM_BASE_MS		696	/* retracted to fully raised */
+#define VIB_PWM_TILT_MS		1160	/* retracted to raised and tilted */
+#define VIB_PWM_TILT_ONLY_MS	400	/* raised to raised and tilted */
+#define VIB_PWM_DOWN_MS		1160	/* retract from any raised position */
+
+/* weak hooks implemented by bbk_hall_core when it is built in */
+/*
+ * The hall framework is a separate driver.  Declaring these weak keeps this
+ * driver linkable and working on its own, and lets bbk_hall_core take over as
+ * soon as it is built in.
+ */
+int __weak bbk_hall_core_enable(int enable)
+{
+	return 0;
+}
+
+int __weak bbk_hall_get_status(void)
+{
+	return 0;
+}
+
+struct vib_pwm {
+	struct device		*dev;
+	struct mutex		lock;
+	struct clk		*gp2_clk;
+	struct pinctrl		*pinctrl;
+	struct pinctrl_state	*pins_active;
+	struct pinctrl_state	*pins_suspend;
+	struct pinctrl_state	*pins_idconfig;
+	int			boost_gpio;
+	int			enable_gpio;
+	int			sleep_gpio;
+	int			dir_gpio;
+	int			id_gpio;
+	struct wakeup_source	wakeup;
+	wait_queue_head_t	wait;
+	struct hrtimer		timer;
+	bool			moving;
+	unsigned int		time_ms;	/* +352 */
+	int			tick_ms;	/* +356 */
+	bool			use_tick;	/* +360 */
+	unsigned long		freq;		/* +400 */
+	int			motor;		/* +412 */
+	int			camera_state;	/* +416 */
+	unsigned int		count;		/* +472 */
+	int			is_in_cali;	/* +540 */
+	bool			cam_up;
+	/* user visible tuning values */
+	int			id;
+	int			state_init;
+	int			holder_mode;
+	int			elevator_mode;
+	int			elevator_row_shift;
+	int			up_down_count;
+	int			abort_notify;
+	int			cali;
+	int			pending_time;
+};
+
+static struct vib_pwm *vib_pwm_dev;
+
+/* ----------------------------------------------------------- motor core -- */
+
+static void vib_pwm_gpio_set(int gpio, int value)
+{
+	if (gpio_is_valid(gpio))
+		gpiod_direction_output_raw(gpio_to_desc(gpio), value);
+}
+
+static void vib_pwm_gpio_input(int gpio)
+{
+	if (gpio_is_valid(gpio))
+		gpiod_direction_input(gpio_to_desc(gpio));
+}
+
+/*
+ * [RE] vib_pwm_set_camera_state, the second half: program the clock, bring the
+ * driver up in the order the vendor used and arm the move timer.
+ */
+static int vib_pwm_motor_start(struct vib_pwm *d, int dir)
+{
+	ktime_t when;
+	int ret;
+
+	/* the vendor programs 32000 Hz for every single move */
+	d->freq = VIB_PWM_DEFAULT_FREQ;
+
+	ret = clk_set_rate(d->gp2_clk, d->freq);
+	if (ret < 0) {
+		dev_err(d->dev, "%s: clk_set_rate(%lu) failed (%d)\n",
+			__func__, d->freq, ret);
+		return ret;
+	}
+
+	bbk_hall_core_enable(0);
+	clk_prepare(d->gp2_clk);
+
+	/* direction first: 0 raises the elevator, 1 lowers it */
+	vib_pwm_gpio_set(d->dir_gpio, dir == 1 ? 0 : 1);
+
+	vib_pwm_gpio_set(d->boost_gpio, 1);
+	msleep(3);
+	vib_pwm_gpio_set(d->enable_gpio, 0);
+	vib_pwm_gpio_set(d->sleep_gpio, 1);
+	msleep(3);
+
+	clk_enable(d->gp2_clk);
+
+	/* move duration: the vendor ticks at 50 ms for very long values */
+	if (d->time_ms > VIB_PWM_TICK_LIMIT) {
+		d->use_tick = true;
+		d->tick_ms = VIB_PWM_TICK_MS;
+		when = ktime_set(0, (u64)VIB_PWM_TICK_MS * NSEC_PER_MSEC);
+	} else {
+		unsigned int ms = d->time_ms * VIB_PWM_MOVE_RATIO_NUM /
+				  VIB_PWM_MOVE_RATIO_DEN;
+		if (!ms)
+			ms = VIB_PWM_TICK_MS;
+		d->time_ms = ms;	/* [RE] the vendor stores the scaled value back */
+		when = ktime_set(0, (u64)ms * NSEC_PER_MSEC);
+	}
+
+	d->count++;
+	d->moving = true;
+	hrtimer_start(&d->timer, when, HRTIMER_MODE_REL_PINNED);
+
+	bbk_hall_core_enable(1);
+	dev_info(d->dev, "%s: moving %s, %u ms, %lu Hz\n", __func__,
+		 dir == 1 ? "up" : "down", d->time_ms, d->freq);
+	return 0;
+}
+
+/* [RE] the stop path of vib_pwm_set_camera_state */
+static void vib_pwm_motor_stop(struct vib_pwm *d)
+{
+	if (d->moving) {
+		hrtimer_cancel(&d->timer);
+		d->moving = false;
+	}
+
+	vib_pwm_gpio_set(d->boost_gpio, 0);
+	msleep(5);
+	vib_pwm_gpio_set(d->enable_gpio, 1);
+	vib_pwm_gpio_set(d->sleep_gpio, 0);
+	clk_disable_unprepare(d->gp2_clk);
+}
+
+/*
+ * End of a move.  The vendor's callback (vib_pwm_state_move_sate) either stops
+ * the motor or, when the move runs in fixed ticks, keeps it running until the
+ * hall sensors report an end position.  We always use the timeout as the
+ * stop condition and additionally stop early when bbk_hall_core reports that
+ * the elevator reached an end position.
+ */
+static enum hrtimer_restart vib_pwm_timer_func(struct hrtimer *timer)
+{
+	struct vib_pwm *d = container_of(timer, struct vib_pwm, timer);
+	int end = bbk_hall_get_status();
+
+	if (d->use_tick && !end) {
+		/* keep chopping in fixed ticks until the hall reports an end */
+		hrtimer_forward_now(timer, ktime_set(0, (u64)d->tick_ms * NSEC_PER_MSEC));
+		return HRTIMER_RESTART;
+	}
+
+	/* we are inside the callback, so do not try to cancel ourselves */
+	d->moving = false;
+	vib_pwm_motor_stop(d);
+
+	mutex_lock(&d->lock);
+	d->camera_state = (d->motor == 1) ? (d->cam_up ? CAM_STATE_UP : CAM_STATE_UP_TILT)
+					  : CAM_STATE_DOWN;
+	d->motor = 0;
+	mutex_unlock(&d->lock);
+
+	wake_up_interruptible(&d->wait);
+	dev_info(d->dev, "%s: move finished, camera_state = %d\n",
+		 __func__, d->camera_state);
+	return HRTIMER_NORESTART;
+}
+
+/*
+ * [RE] vib_pwm_set_camera: the transition table.  want is the value userspace
+ * writes to vib_pwm_camera_state.
+ */
+int vib_pwm_set_camera(int want)
+{
+	struct vib_pwm *d = vib_pwm_dev;
+	int cur, ret = 0;
+
+	if (!d)
+		return -ENODEV;
+
+	mutex_lock(&d->lock);
+	cur = d->camera_state;
+
+	/* [RE] states 4 and 5 are busy, and a calibration blocks a move */
+	if ((cur & ~1) == CAM_STATE_BUSY_UP || d->is_in_cali) {
+		dev_info(d->dev,
+			 "%s: want %d, current %d, is_in_cali %d: busy, ignored\n",
+			 __func__, want, cur, d->is_in_cali);
+		goto out;
+	}
+
+	if (cur == want) {
+		dev_info(d->dev, "%s: already in state %d\n", __func__, want);
+		goto out;
+	}
+
+	switch (want) {
+	case CAM_STATE_UP:
+		/*
+		 * Raise out of the body.  [RE] the vendor computes
+		 * "696 + parameter / 1000" for this transition, so 696 ms is the
+		 * base and the calibration parameter only trims it.
+		 */
+		d->cam_up = true;
+		d->motor = 1;
+		d->camera_state = CAM_STATE_BUSY_UP;
+		d->time_ms = d->pending_time ? d->pending_time : VIB_PWM_BASE_MS;
+		break;
+	case CAM_STATE_UP_TILT:
+		/* raise and then tilt: the second stage keeps going up */
+		d->cam_up = false;
+		d->motor = 1;
+		d->camera_state = CAM_STATE_BUSY_UP;
+		d->time_ms = d->pending_time ? d->pending_time : VIB_PWM_TILT_MS;
+		break;
+	case CAM_STATE_DOWN:
+		/* retract */
+		d->cam_up = false;
+		d->motor = 2;
+		d->camera_state = CAM_STATE_BUSY_DOWN;
+		d->time_ms = d->pending_time ? d->pending_time : VIB_PWM_DOWN_MS;
+		break;
+	default:
+		dev_info(d->dev, "%s: unrecognised camera state %d\n", __func__, want);
+		goto out;
+	}
+
+	/* when the elevator is already up, only the tilt remainder is needed */
+	if (want == CAM_STATE_UP_TILT && cur == CAM_STATE_UP)
+		d->time_ms = d->pending_time ? d->pending_time : VIB_PWM_TILT_ONLY_MS;
+
+	if (d->state_init)
+		__pm_stay_awake(&d->wakeup);
+
+	ret = vib_pwm_motor_start(d, d->motor);
+	if (ret) {
+		d->camera_state = cur;
+		d->motor = 0;
+		if (d->state_init)
+			__pm_relax(&d->wakeup);
+		goto out;
+	}
+
+	d->count++;
+	wake_up_interruptible(&d->wait);
+	dev_info(d->dev, "%s: want %d, current %d -> starting motor %d for %u ms\n",
+		 __func__, want, cur, d->motor, d->time_ms);
+out:
+	mutex_unlock(&d->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(vib_pwm_set_camera);
+
+int get_camera_state(void)
+{
+	return vib_pwm_dev ? vib_pwm_dev->camera_state : CAM_STATE_DOWN;
+}
+EXPORT_SYMBOL_GPL(get_camera_state);
+
+void cancel_vib_hrtimer(void)
+{
+	if (vib_pwm_dev)
+		vib_pwm_motor_stop(vib_pwm_dev);
+}
+EXPORT_SYMBOL_GPL(cancel_vib_hrtimer);
+
+bool vib_is_move(void)
+{
+	return vib_pwm_dev ? vib_pwm_dev->moving : false;
+}
+EXPORT_SYMBOL_GPL(vib_is_move);
+
+bool vib_is_in_cali(void)
+{
+	return vib_pwm_dev ? !!vib_pwm_dev->is_in_cali : false;
+}
+EXPORT_SYMBOL_GPL(vib_is_in_cali);
+
+void set_vib_all_time(int t)
+{
+	if (vib_pwm_dev)
+		vib_pwm_dev->pending_time = t;
+}
+EXPORT_SYMBOL_GPL(set_vib_all_time);
+
+void set_vib_up_down_count(int c)
+{
+	if (vib_pwm_dev)
+		vib_pwm_dev->up_down_count = c;
+}
+EXPORT_SYMBOL_GPL(set_vib_up_down_count);
+
+/* ------------------------------------------------------------ sysfs ---- */
+
+static ssize_t vib_pwm_id_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct vib_pwm *d = dev_get_drvdata(dev);
+
+	if (!d || !gpio_is_valid(d->id_gpio))
+		d->id = 0;
+	else
+		d->id = gpiod_get_raw_value(gpio_to_desc(d->id_gpio));
+
+	return sprintf(buf, "%d\n", d->id);
+}
+
+static ssize_t vib_pwm_frequency_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct vib_pwm *d = dev_get_drvdata(dev);
+
+	return sprintf(buf, "%lu\n", d->freq);
+}
+
+static ssize_t vib_pwm_frequency_store(struct device *dev, struct device_attribute *attr,
+				       const char *buf, size_t count)
+{
+	struct vib_pwm *d = dev_get_drvdata(dev);
+	int v;
+
+	if (kstrtoint(buf, 10, &v) == 0)
+		d->freq = v;
+	return count;
+}
+
+static ssize_t vib_pwm_count_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct vib_pwm *d = dev_get_drvdata(dev);
+
+	return sprintf(buf, "%u\n", d->count);
+}
+
+static ssize_t vib_pwm_count_store(struct device *dev, struct device_attribute *attr,
+				   const char *buf, size_t count)
+{
+	struct vib_pwm *d = dev_get_drvdata(dev);
+	int v;
+
+	if (kstrtoint(buf, 10, &v) == 0)
+		d->count = v;
+	return count;
+}
+
+static ssize_t vib_pwm_enable_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct vib_pwm *d = dev_get_drvdata(dev);
+
+	return sprintf(buf, "%d\n", d->moving ? 1 : 0);
+}
+
+static ssize_t vib_pwm_enable_store(struct device *dev, struct device_attribute *attr,
+				    const char *buf, size_t count)
+{
+	struct vib_pwm *d = dev_get_drvdata(dev);
+	int v;
+
+	if (kstrtoint(buf, 10, &v))
+		return count;
+
+	mutex_lock(&d->lock);
+	if (v) {
+		d->motor = d->cam_up ? 1 : 2;
+		if (vib_pwm_motor_start(d, d->motor))
+			d->motor = 0;
+	} else {
+		vib_pwm_motor_stop(d);
+		d->motor = 0;
+	}
+	mutex_unlock(&d->lock);
+	return count;
+}
+
+static ssize_t vib_pwm_dir_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct vib_pwm *d = dev_get_drvdata(dev);
+
+	return sprintf(buf, "%d\n",
+		       gpio_is_valid(d->dir_gpio) ?
+		       gpiod_get_raw_value(gpio_to_desc(d->dir_gpio)) : 0);
+}
+
+/* [RE] the vendor looks at the first character only: '1' is one, else zero */
+static ssize_t vib_pwm_dir_store(struct device *dev, struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	struct vib_pwm *d = dev_get_drvdata(dev);
+
+	if (buf && count)
+		vib_pwm_gpio_set(d->dir_gpio, buf[0] == '1');
+	return count;
+}
+
+static ssize_t vib_pwm_time_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct vib_pwm *d = dev_get_drvdata(dev);
+
+	return sprintf(buf, "%u %d\n", d->time_ms, d->pending_time);
+}
+
+/* [RE] the vendor treats 1300 as "use the parameter, plus ten" */
+static ssize_t vib_pwm_time_store(struct device *dev, struct device_attribute *attr,
+				  const char *buf, size_t count)
+{
+	struct vib_pwm *d = dev_get_drvdata(dev);
+	int v;
+
+	if (kstrtoint(buf, 10, &v))
+		return count;
+
+	if (v == VIB_PWM_TIME_MAGIC) {
+		d->pending_time = 0;
+		dev_info(d->dev, "%s: %d means use the default move time\n",
+			 __func__, v);
+		v = 1290;
+	}
+	d->time_ms = v;
+	return count;
+}
+
+static ssize_t vib_pwm_camera_state_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct vib_pwm *d = dev_get_drvdata(dev);
+
+	return sprintf(buf, "%d\n", d->camera_state);
+}
+
+static ssize_t vib_pwm_camera_state_store(struct device *dev, struct device_attribute *attr,
+					  const char *buf, size_t count)
+{
+	int state = 0;
+
+	dev_info(dev, "%s: want to set camera_state: %s", __func__, buf);
+	if (!buf || !count)
+		return count;
+	if (kstrtoint(buf, 10, &state)) {
+		dev_err(dev, "%s: camera_state_store get error state\n", __func__);
+		return count;
+	}
+	vib_pwm_set_camera(state);
+	return count;
+}
+
+static ssize_t vib_pwm_state_init_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct vib_pwm *d = dev_get_drvdata(dev);
+
+	return sprintf(buf, "%d\n", d->state_init);
+}
+
+static ssize_t vib_pwm_state_init_store(struct device *dev, struct device_attribute *attr,
+					const char *buf, size_t count)
+{
+	struct vib_pwm *d = dev_get_drvdata(dev);
+	int v;
+
+	if (kstrtoint(buf, 10, &v) == 0) {
+		d->state_init = v;
+		/* the vendor measures how long a full retract-to-up move takes */
+		if (v)
+			__pm_stay_awake(&d->wakeup);
+	}
+	return count;
+}
+
+static ssize_t vib_pwm_abort_notify_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct vib_pwm *d = dev_get_drvdata(dev);
+
+	return sprintf(buf, "%d\n", d->abort_notify);
+}
+
+static ssize_t vib_pwm_abort_notify_store(struct device *dev, struct device_attribute *attr,
+					  const char *buf, size_t count)
+{
+	struct vib_pwm *d = dev_get_drvdata(dev);
+	int v;
+
+	if (kstrtoint(buf, 10, &v))
+		return count;
+	d->abort_notify = v;
+
+	/*
+	 * [RE] the vendor restarts the elevator when it is notified that the
+	 * camera page was dismissed while the front camera was in use.
+	 */
+	switch (v) {
+	case 1:
+		dev_info(d->dev, "%s: RESTART_CAMERA_ELEVATOR to elevator_mode %d\n",
+			 __func__, d->elevator_mode);
+		vib_pwm_set_camera(CAM_STATE_UP);
+		break;
+	case 2:
+		dev_info(d->dev,
+			 "%s: KEY_CAMERA_POWER_ONOFF_PAGE_DISMISS: RESTART_CAMERA_ELEVATOR to elevator_mode %d\n",
+			 __func__, d->elevator_mode);
+		break;
+	default:
+		break;
+	}
+	return count;
+}
+
+static ssize_t vib_pwm_holder_mode_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct vib_pwm *d = dev_get_drvdata(dev);
+
+	return sprintf(buf, "%d\n", d->holder_mode);
+}
+
+static ssize_t vib_pwm_holder_mode_store(struct device *dev, struct device_attribute *attr,
+					 const char *buf, size_t count)
+{
+	struct vib_pwm *d = dev_get_drvdata(dev);
+	int v;
+
+	if (kstrtoint(buf, 10, &v) == 0)
+		d->holder_mode = v;
+	return count;
+}
+
+static ssize_t vib_pwm_elevator_mode_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct vib_pwm *d = dev_get_drvdata(dev);
+
+	return sprintf(buf, "%d\n", d->elevator_mode);
+}
+
+static ssize_t vib_pwm_elevator_mode_store(struct device *dev, struct device_attribute *attr,
+					   const char *buf, size_t count)
+{
+	struct vib_pwm *d = dev_get_drvdata(dev);
+	int v;
+
+	if (kstrtoint(buf, 10, &v) == 0)
+		d->elevator_mode = v;
+	return count;
+}
+
+static ssize_t vib_pwm_elevator_row_shift_show(struct device *dev, struct device_attribute *attr,
+					       char *buf)
+{
+	struct vib_pwm *d = dev_get_drvdata(dev);
+
+	return sprintf(buf, "%d\n", d->elevator_row_shift);
+}
+
+static ssize_t vib_pwm_cali_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct vib_pwm *d = dev_get_drvdata(dev);
+
+	return sprintf(buf, "%d\n", d->cali);
+}
+
+static ssize_t vib_pwm_cali_store(struct device *dev, struct device_attribute *attr,
+				  const char *buf, size_t count)
+{
+	struct vib_pwm *d = dev_get_drvdata(dev);
+	int v;
+
+	if (kstrtoint(buf, 10, &v) == 0) {
+		d->cali = v;
+		d->is_in_cali = v ? 1 : 0;
+	}
+	return count;
+}
+
+static ssize_t vib_pwm_up_down_count_show(struct device *dev, struct device_attribute *attr,
+					  char *buf)
+{
+	struct vib_pwm *d = dev_get_drvdata(dev);
+
+	return sprintf(buf, "%d\n", d->up_down_count);
+}
+
+static ssize_t vib_pwm_up_down_count_store(struct device *dev, struct device_attribute *attr,
+					   const char *buf, size_t count)
+{
+	struct vib_pwm *d = dev_get_drvdata(dev);
+	int v;
+
+	if (kstrtoint(buf, 10, &v) == 0)
+		d->up_down_count = v;
+	return count;
+}
+
+static ssize_t vib_pwm_clear_cali_data_show(struct device *dev, struct device_attribute *attr,
+					    char *buf)
+{
+	struct vib_pwm *d = dev_get_drvdata(dev);
+
+	return sprintf(buf, "%d\n", d->cali);
+}
+
+static ssize_t vib_pwm_clear_cali_data_store(struct device *dev, struct device_attribute *attr,
+					     const char *buf, size_t count)
+{
+	struct vib_pwm *d = dev_get_drvdata(dev);
+
+	d->cali = 0;
+	d->is_in_cali = 0;
+	d->up_down_count = 0;
+	dev_info(d->dev, "%s: calibration data cleared\n", __func__);
+	return count;
+}
+
+static DEVICE_ATTR_RO(vib_pwm_id);
+static DEVICE_ATTR_RW(vib_pwm_frequency);
+static DEVICE_ATTR_RW(vib_pwm_count);
+static DEVICE_ATTR_RW(vib_pwm_enable);
+static DEVICE_ATTR_RW(vib_pwm_dir);
+static DEVICE_ATTR_RW(vib_pwm_time);
+static DEVICE_ATTR_RW(vib_pwm_camera_state);
+static DEVICE_ATTR_RW(vib_pwm_state_init);
+static DEVICE_ATTR_RW(vib_pwm_abort_notify);
+static DEVICE_ATTR_RW(vib_pwm_holder_mode);
+static DEVICE_ATTR_RW(vib_pwm_elevator_mode);
+static DEVICE_ATTR_RO(vib_pwm_elevator_row_shift);
+static DEVICE_ATTR_RW(vib_pwm_cali);
+static DEVICE_ATTR_RW(vib_pwm_up_down_count);
+static DEVICE_ATTR_RW(vib_pwm_clear_cali_data);
+
+static struct attribute *vib_pwm_attrs[] = {
+	&dev_attr_vib_pwm_id.attr,
+	&dev_attr_vib_pwm_frequency.attr,
+	&dev_attr_vib_pwm_count.attr,
+	&dev_attr_vib_pwm_enable.attr,
+	&dev_attr_vib_pwm_dir.attr,
+	&dev_attr_vib_pwm_time.attr,
+	&dev_attr_vib_pwm_camera_state.attr,
+	&dev_attr_vib_pwm_state_init.attr,
+	&dev_attr_vib_pwm_abort_notify.attr,
+	&dev_attr_vib_pwm_holder_mode.attr,
+	&dev_attr_vib_pwm_elevator_mode.attr,
+	&dev_attr_vib_pwm_elevator_row_shift.attr,
+	&dev_attr_vib_pwm_cali.attr,
+	&dev_attr_vib_pwm_up_down_count.attr,
+	&dev_attr_vib_pwm_clear_cali_data.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(vib_pwm);
+
+/* ------------------------------------------------------------- probe ---- */
+
+static int vib_pwm_probe(struct platform_device *pdev)
+{
+	struct device *dev = &pdev->dev;
+	struct device_node *np = dev->of_node;
+	struct vib_pwm *d;
+	int ret;
+
+	d = devm_kzalloc(dev, sizeof(*d), GFP_KERNEL);
+	if (!d)
+		return -ENOMEM;
+
+	d->dev = dev;
+	mutex_init(&d->lock);
+	init_waitqueue_head(&d->wait);
+	platform_set_drvdata(pdev, d);
+	dev_set_drvdata(dev, d);
+
+	/* [RE] the vendor parses the gpios in device tree order */
+	d->boost_gpio = of_get_named_gpio(np, "boost-gpio", 0);
+	d->enable_gpio = of_get_named_gpio(np, "enable-gpio", 0);
+	d->sleep_gpio = of_get_named_gpio(np, "sleep-gpio", 0);
+	d->dir_gpio = of_get_named_gpio(np, "dir-gpio", 0);
+	d->id_gpio = of_get_named_gpio(np, "id-gpio", 0);
+
+	if (!gpio_is_valid(d->boost_gpio) || !gpio_is_valid(d->enable_gpio) ||
+	    !gpio_is_valid(d->sleep_gpio) || !gpio_is_valid(d->dir_gpio)) {
+		dev_err(dev, "%s: one of the motor gpios is missing\n", __func__);
+		return -EINVAL;
+	}
+
+	ret = devm_gpio_request(dev, d->boost_gpio, "vib_pwm_boost");
+	ret |= devm_gpio_request(dev, d->enable_gpio, "vib_pwm_enable");
+	ret |= devm_gpio_request(dev, d->sleep_gpio, "vib_pwm_sleep");
+	ret |= devm_gpio_request(dev, d->dir_gpio, "vib_pwm_dir");
+	if (ret) {
+		dev_err(dev, "%s: gpio request failed (%d)\n", __func__, ret);
+		return ret;
+	}
+	if (gpio_is_valid(d->id_gpio))
+		devm_gpio_request(dev, d->id_gpio, "vib_pwm_id");
+
+	d->gp2_clk = devm_clk_get(dev, "gp2_clk");
+	if (IS_ERR(d->gp2_clk)) {
+		ret = PTR_ERR(d->gp2_clk);
+		dev_err(dev, "%s: failed to get gp2_clk (%d)\n", __func__, ret);
+		return ret;
+	}
+
+	d->pinctrl = devm_pinctrl_get(dev);
+	if (!IS_ERR(d->pinctrl)) {
+		d->pins_active = pinctrl_lookup_state(d->pinctrl, "vib_pwm_active");
+		d->pins_suspend = pinctrl_lookup_state(d->pinctrl, "vib_pwm_suspend");
+		d->pins_idconfig = pinctrl_lookup_state(d->pinctrl, "vib_pwm_idconfig");
+		if (!IS_ERR(d->pins_suspend))
+			pinctrl_select_state(d->pinctrl, d->pins_suspend);
+		if (!IS_ERR(d->pins_idconfig))
+			pinctrl_select_state(d->pinctrl, d->pins_idconfig);
+	}
+
+	wakeup_source_init(&d->wakeup, "vib_pwm");
+	hrtimer_init(&d->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED);
+	d->timer.function = vib_pwm_timer_func;
+
+	/* defaults, matching the vendor's initial values */
+	d->freq = VIB_PWM_DEFAULT_FREQ;
+	d->time_ms = 696;
+	d->camera_state = CAM_STATE_DOWN;
+	d->motor = 0;
+	d->is_in_cali = 0;
+
+	/* put the driver into its idle state */
+	vib_pwm_gpio_set(d->boost_gpio, 0);
+	vib_pwm_gpio_set(d->enable_gpio, 1);
+	vib_pwm_gpio_set(d->sleep_gpio, 0);
+	vib_pwm_gpio_set(d->dir_gpio, 1);
+	if (gpio_is_valid(d->id_gpio))
+		vib_pwm_gpio_input(d->id_gpio);
+
+	vib_pwm_dev = d;
+
+	if (d->pins_idconfig != NULL && !IS_ERR(d->pins_idconfig)) {
+		/* read the module id through the pull-up strap */
+		d->id = gpio_is_valid(d->id_gpio) ?
+			gpiod_get_raw_value(gpio_to_desc(d->id_gpio)) : 0;
+		dev_info(dev, "%s: elevator id = %d\n", __func__, d->id);
+	}
+
+	/* this vendor kernel has no dev_groups, so add them by hand */
+	ret = sysfs_create_groups(&dev->kobj, vib_pwm_groups);
+	if (ret) {
+		dev_err(dev, "%s: sysfs_create_groups failed (%d)\n", __func__, ret);
+		return ret;
+	}
+
+	dev_info(dev, "%s: probed, gp2_clk %lu Hz, camera_state %d\n",
+		 __func__, clk_get_rate(d->gp2_clk), d->camera_state);
+	return 0;
+}
+
+static int vib_pwm_remove(struct platform_device *pdev)
+{
+	struct vib_pwm *d = platform_get_drvdata(pdev);
+
+	if (d) {
+		vib_pwm_motor_stop(d);
+		wakeup_source_destroy(&d->wakeup);
+	}
+	sysfs_remove_groups(&pdev->dev.kobj, vib_pwm_groups);
+	vib_pwm_dev = NULL;
+	return 0;
+}
+
+static int __maybe_unused vib_pwm_suspend(struct device *dev)
+{
+	struct vib_pwm *d = dev_get_drvdata(dev);
+
+	if (d && !d->moving && d->pinctrl && !IS_ERR(d->pins_suspend))
+		pinctrl_select_state(d->pinctrl, d->pins_suspend);
+	return 0;
+}
+
+static const struct dev_pm_ops vib_pwm_pm_ops = {
+	SET_SYSTEM_SLEEP_PM_OPS(vib_pwm_suspend, NULL)
+};
+
+static const struct of_device_id vib_pwm_of_match[] = {
+	{ .compatible = "bbk,vib_pwm_control" },
+	{ }
+};
+MODULE_DEVICE_TABLE(of, vib_pwm_of_match);
+
+static struct platform_driver vib_pwm_driver = {
+	.probe		= vib_pwm_probe,
+	.remove		= vib_pwm_remove,
+	.driver		= {
+		.name		= VIB_PWM_DRV_NAME,
+		.of_match_table	= vib_pwm_of_match,
+		.pm		= &vib_pwm_pm_ops,
+	},
+};
+module_platform_driver(vib_pwm_driver);
+
+MODULE_AUTHOR("EEBBK S6 kernel reconstruction");
+MODULE_DESCRIPTION("BBK elevator camera motor controller (reconstructed from the factory binary)");
+MODULE_LICENSE("GPL v2");
