@@ -655,15 +655,15 @@ static ssize_t vib_pwm_id_show(struct device *dev, struct device_attribute *attr
 	return sprintf(buf, "vib_id=%d\n", id);
 }
 
-static ssize_t vib_pwm_frequency_show(struct device *dev, struct device_attribute *attr, char *buf)
+static ssize_t vib_pwm_freq_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct vib_pwm *d = dev_get_drvdata(dev);
 
 	return sprintf(buf, "vib_freq=%d\n", (int)d->freq);
 }
 
-static ssize_t vib_pwm_frequency_store(struct device *dev, struct device_attribute *attr,
-				       const char *buf, size_t count)
+static ssize_t vib_pwm_freq_store(struct device *dev, struct device_attribute *attr,
+				  const char *buf, size_t count)
 {
 	struct vib_pwm *d = dev_get_drvdata(dev);
 	int v;
@@ -1057,7 +1057,11 @@ static ssize_t vib_pwm_clear_cali_data_store(struct device *dev, struct device_a
 }
 
 static DEVICE_ATTR_RO(vib_pwm_id);
-static DEVICE_ATTR_RW(vib_pwm_frequency);
+/*
+ * [RE] the attribute is called vib_pwm_freq, not vib_pwm_frequency: the factory
+ * name string at 0x99f7617 is "vib_pwm_freq" and userspace opens that path.
+ */
+static DEVICE_ATTR_RW(vib_pwm_freq);
 static DEVICE_ATTR_RW(vib_pwm_count);
 static DEVICE_ATTR_RW(vib_pwm_enable);
 static DEVICE_ATTR_RW(vib_pwm_dir);
@@ -1074,7 +1078,7 @@ static DEVICE_ATTR_RW(vib_pwm_clear_cali_data);
 
 static struct attribute *vib_pwm_attrs[] = {
 	&dev_attr_vib_pwm_id.attr,
-	&dev_attr_vib_pwm_frequency.attr,
+	&dev_attr_vib_pwm_freq.attr,
 	&dev_attr_vib_pwm_count.attr,
 	&dev_attr_vib_pwm_enable.attr,
 	&dev_attr_vib_pwm_dir.attr,
