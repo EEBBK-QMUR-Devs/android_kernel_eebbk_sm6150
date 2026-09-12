@@ -900,3 +900,38 @@ config INPUT_IST8801
 
 	  The driver was reconstructed from the vendor kernel binary because the
 	  vendor sources are not part of this tree.
+
+config INPUT_MXM1120
+	bool
+	depends on I2C
+	help
+	  Hidden option that builds the Magnachip MXM1120 hall switch driver.  It
+	  is selected by the board options below; the sensor position (up, down or
+	  middle) is taken from the device tree compatible, not from the config.
+
+	  The driver was reconstructed from the vendor kernel binary because the
+	  vendor sources are not part of this tree.
+
+config INPUT_MXM1120_UP
+	bool "Magnachip MXM1120 up hall switch"
+	depends on I2C
+	select INPUT_MXM1120
+	help
+	  Say Y here to support the up Magnachip MXM1120 hall-effect switch
+	  (dt: magnachip,mxm1120,up).
+
+config INPUT_MXM1120_DOWN
+	bool "Magnachip MXM1120 down hall switch"
+	depends on I2C
+	select INPUT_MXM1120
+	help
+	  Say Y here to support the down Magnachip MXM1120 hall-effect switch
+	  (dt: magnachip,mxm1120,down).
+
+config INPUT_MXM1120_MIDDLE
+	bool "Magnachip MXM1120 middle hall switch"
+	depends on I2C
+	select INPUT_MXM1120
+	help
+	  Say Y here to support the middle Magnachip MXM1120 hall-effect switch
+	  (dt: magnachip,mxm1120,middle).
