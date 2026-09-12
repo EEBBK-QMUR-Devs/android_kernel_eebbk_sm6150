@@ -63,8 +63,8 @@ jobs:
           export TARGET_PRODUCT=sm6150
 
           cd $GITHUB_WORKSPACE/workdir/source
-          make -j$(nproc --all) O=out CC=clang vendor/sdmsteppe-perf_defconfig h130.config
-          make -j$(nproc --all) O=out CC=clang DTC=dtc 2>&1 | tee kernel.log
+          make -j$(nproc --all) O=out CC=clang LD=ld.lld vendor/sdmsteppe-perf_defconfig h130.config
+          make -j$(nproc --all) O=out CC=clang DTC=dtc LD=ld.lld 2>&1 | tee kernel.log
 
       - name: Upload logs
         uses: actions/upload-artifact@v4
