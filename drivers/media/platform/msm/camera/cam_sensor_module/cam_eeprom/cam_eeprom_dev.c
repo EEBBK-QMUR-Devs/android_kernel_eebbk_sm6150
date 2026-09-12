@@ -10,6 +10,9 @@
  * GNU General Public License for more details.
  */
 
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
+#include <linux/vmalloc.h>
 #include "cam_eeprom_dev.h"
 #include "cam_req_mgr_dev.h"
 #include "cam_eeprom_soc.h"
@@ -74,6 +77,562 @@ int32_t cam_eeprom_update_i2c_info(struct cam_eeprom_ctrl_t *e_ctrl,
 		CAM_DBG(CAM_EEPROM, "Slave addr: 0x%x", i2c_info->slave_addr);
 	}
 	return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * EEBBK (BBK) camera module information
+ *
+ * The factory firmware publishes the camera module identification of both
+ * cameras through /proc/driver/BackCamera_info and
+ * /proc/driver/FrontCamera_info.  The content is the EEPROM memory map that
+ * is read once by the kernel during probe; the module vendor is derived from
+ * the module id bytes and the whole map is dumped as register/value pairs.
+ * ---------------------------------------------------------------------------
+ */
+#define BBK_BACK_INFO_PROC	"driver/BackCamera_info"
+#define BBK_FRONT_INFO_PROC	"driver/FrontCamera_info"
+#define BBK_INFO_PROC_MODE	0664
+#define BBK_MODULE_ID_LEN	20
+#define BBK_BACK_REG_BASE	0xADD
+#define BBK_FRONT_REG_BASE	0x6EF
+#define BBK_INFO_ID_OFFSET	21
+#define BBK_INFO_ID_LEN		16
+#define BBK_INFO_ID_MIN_LEN	0x26
+#define BBK_INFO_ID_FLAG	0x01
+
+static uint8_t  *bbk_back_info_data;
+static uint32_t  bbk_back_info_size;
+static uint8_t  *bbk_front_info_data;
+static uint32_t  bbk_front_info_size;
+
+/* Rear camera: Samsung s5k3l6 (13M) */
+#define BBK_BACK_S5K3L6(vendor) \
+	"Module Vendor: " vendor " %s, Image Sensor: " \
+	"Samsung s5k3l6(13M)(AF)(RAW)(MIPI)\n"
+
+/* Front camera: OmniVision ov16a10 (16M) / Samsung s5k4h7 (8M) */
+#define BBK_FRONT_OV16A10(vendor) \
+	"Module Vendor: " vendor " %s, Image Sensor: " \
+	"OmniVision ov16a10(16M)(FF)(RAW)(MIPI)\n"
+#define BBK_FRONT_H110_OV16A10(vendor) \
+	"H110 Module Vendor: " vendor " %s, Image Sensor: " \
+	"OmniVision ov16a10(16M)(FF)(RAW)(MIPI)\n"
+#define BBK_FRONT_S5K4H7(vendor) \
+	"Module Vendor: " vendor " %s, Image Sensor: " \
+	"Samsung s5k4h7(8M)(FF)(RAW)(MIPI)\n"
+
+/**
+ * bbk_back_info_vendor - resolve the rear camera module vendor
+ * @buf: module id bytes read from the EEPROM
+ * @len: number of valid bytes in @buf
+ *
+ * Returns the format string describing the detected module.
+ */
+static const char *bbk_back_info_vendor(uint8_t *buf, uint32_t len)
+{
+	if (!len)
+		return BBK_BACK_S5K3L6("Q Tech");
+
+	if (buf[0] == 0x05) {			/* Coe125 */
+		if (len <= 1)
+			return BBK_BACK_S5K3L6("Coe125");
+		if (buf[1])
+			return BBK_BACK_S5K3L6("unknown");
+		if (len < 7)
+			return BBK_BACK_S5K3L6("Coe125");
+		if (buf[6])
+			return BBK_BACK_S5K3L6("unknown");
+		if (len < 8)
+			return BBK_BACK_S5K3L6("Coe125");
+		if (buf[7])
+			return BBK_BACK_S5K3L6("unknown");
+		if (len < 9)
+			return BBK_BACK_S5K3L6("Coe125");
+		if (buf[8])
+			return BBK_BACK_S5K3L6("unknown");
+		if (len < 10)
+			return BBK_BACK_S5K3L6("Coe125");
+		if (buf[9])
+			return BBK_BACK_S5K3L6("unknown");
+
+		return BBK_BACK_S5K3L6("Coe125");
+	}
+
+	if (buf[0] == 0x02) {			/* Truly */
+		if (len <= 1)
+			return BBK_BACK_S5K3L6("Truly");
+		if (buf[1])
+			return BBK_BACK_S5K3L6("unknown");
+		if (len < 7)
+			return BBK_BACK_S5K3L6("Truly");
+		if (buf[6] != 0x64)
+			return BBK_BACK_S5K3L6("unknown");
+		if (len < 8)
+			return BBK_BACK_S5K3L6("Truly");
+		if (buf[7] != 0x71)
+			return BBK_BACK_S5K3L6("unknown");
+		if (len < 9)
+			return BBK_BACK_S5K3L6("Truly");
+		if (buf[8] != 0x18)
+			return BBK_BACK_S5K3L6("unknown");
+		if (len < 10)
+			return BBK_BACK_S5K3L6("Truly");
+		if (buf[9] != 0xc1)
+			return BBK_BACK_S5K3L6("unknown");
+
+		return BBK_BACK_S5K3L6("Truly");
+	}
+
+	if (buf[0] != 0x01)
+		return BBK_BACK_S5K3L6("unknown");
+
+	if (len <= 1)
+		return BBK_BACK_S5K3L6("Q Tech");
+
+	if (buf[1] == 0xa0) {			/* TSP */
+		if (len < 6)
+			return BBK_BACK_S5K3L6("TSP");
+		if (buf[5])
+			return BBK_BACK_S5K3L6("unknown");
+		if (len < 7)
+			return BBK_BACK_S5K3L6("TSP");
+		if (buf[6])
+			return BBK_BACK_S5K3L6("unknown");
+		if (len < 8)
+			return BBK_BACK_S5K3L6("TSP");
+		if (buf[7])
+			return BBK_BACK_S5K3L6("unknown");
+
+		return BBK_BACK_S5K3L6("TSP");
+	}
+
+	if (buf[1] != 0x06)			/* Q Tech */
+		return BBK_BACK_S5K3L6("unknown");
+
+	if (len < 6)
+		return BBK_BACK_S5K3L6("Q Tech");
+	if (buf[5])
+		return BBK_BACK_S5K3L6("unknown");
+	if (len < 7)
+		return BBK_BACK_S5K3L6("Q Tech");
+	if (buf[6])
+		return BBK_BACK_S5K3L6("unknown");
+	if (len < 8)
+		return BBK_BACK_S5K3L6("Q Tech");
+	if (buf[7])
+		return BBK_BACK_S5K3L6("unknown");
+
+	return BBK_BACK_S5K3L6("Q Tech");
+}
+
+/**
+ * bbk_front_info_vendor - resolve the front camera module vendor
+ * @buf: module id bytes read from the EEPROM
+ * @len: number of valid bytes in @buf
+ *
+ * Returns the format string describing the detected module.
+ */
+static const char *bbk_front_info_vendor(uint8_t *buf, uint32_t len)
+{
+	if (!len)
+		return BBK_FRONT_OV16A10("TSP");
+
+	if (buf[0] == 0xa0) {			/* H110 / TSP ov16a10 */
+		if (len <= 1)
+			return BBK_FRONT_H110_OV16A10("TSP");
+		if (buf[1])
+			return BBK_FRONT_S5K4H7("unknown");
+		if (len < 7)
+			return BBK_FRONT_H110_OV16A10("TSP");
+		if (buf[6] != 0x41)
+			return BBK_FRONT_S5K4H7("unknown");
+		if (len < 8)
+			return BBK_FRONT_H110_OV16A10("TSP");
+		if (buf[7] != 0x16)
+			return BBK_FRONT_S5K4H7("unknown");
+
+		return BBK_FRONT_H110_OV16A10("TSP");
+	}
+
+	if (buf[0] != 0x01)
+		return BBK_FRONT_S5K4H7("unknown");
+
+	if (len <= 1)
+		return BBK_FRONT_OV16A10("TSP");
+
+	if (buf[1] == 0x06) {			/* Q Tech ov16a10 */
+		if (len < 8)
+			return BBK_FRONT_OV16A10("Q Tech");
+		if (!buf[7]) {
+			if (len < 9)
+				return BBK_FRONT_OV16A10("Q Tech");
+			if (!buf[8]) {
+				if (len < 10)
+					return BBK_FRONT_OV16A10("Q Tech");
+				if (!buf[9])
+					return BBK_FRONT_OV16A10("Q Tech");
+			}
+		}
+	} else if (buf[1] == 0x0a) {		/* TSP ov16a10 */
+		if (len < 7)
+			return BBK_FRONT_OV16A10("TSP");
+		if (!buf[6]) {
+			if (len < 8)
+				return BBK_FRONT_OV16A10("TSP");
+			if (!buf[7]) {
+				if (len < 9)
+					return BBK_FRONT_OV16A10("TSP");
+				if (!buf[8]) {
+					if (len < 10)
+						return BBK_FRONT_OV16A10("TSP");
+					if (!buf[9])
+						return BBK_FRONT_OV16A10("TSP");
+				}
+			}
+		}
+	}
+
+	/* Samsung s5k4h7 (8M) family */
+	if (buf[1] != 0x01)
+		return BBK_FRONT_S5K4H7("unknown");
+
+	if (len < 3)
+		return BBK_FRONT_S5K4H7("LiteArray");
+	if (buf[2] == 0x10) {
+		if (len < 4)
+			return BBK_FRONT_S5K4H7("LiteArray");
+		if (buf[3] == 0x0c) {
+			if (len < 5)
+				return BBK_FRONT_S5K4H7("LiteArray");
+			if (buf[4] == 0xd0) {
+				if (len < 6)
+					return BBK_FRONT_S5K4H7("LiteArray");
+				if (buf[5] == 0x09) {
+					if (len < 7)
+						return BBK_FRONT_S5K4H7(
+							"LiteArray");
+					if (buf[6] == 0xa0) {
+						if (len < 0xc)
+							return
+							BBK_FRONT_S5K4H7(
+							"LiteArray");
+						if (!buf[11]) {
+							if (len < 0xd)
+								return
+								BBK_FRONT_S5K4H7(
+								"LiteArray");
+							if (buf[12] != 0x04)
+								goto second;
+							if (len < 0xe)
+								return
+								BBK_FRONT_S5K4H7(
+								"LiteArray");
+							if (buf[13])
+								goto second;
+							if (len < 0xf)
+								return
+								BBK_FRONT_S5K4H7(
+								"LiteArray");
+							if (buf[14])
+								goto second;
+
+							return
+							BBK_FRONT_S5K4H7(
+								"LiteArray");
+						}
+					}
+				}
+			}
+		}
+	}
+
+second:
+	/* Truly s5k4h7 */
+	if (buf[2] != 0x10)
+		return BBK_FRONT_S5K4H7("unknown");
+	if (len < 4)
+		return BBK_FRONT_S5K4H7("Truly");
+	if (buf[3] != 0x0c)
+		return BBK_FRONT_S5K4H7("unknown");
+	if (len < 5)
+		return BBK_FRONT_S5K4H7("Truly");
+	if (buf[4] != 0xd0)
+		return BBK_FRONT_S5K4H7("unknown");
+	if (len < 6)
+		return BBK_FRONT_S5K4H7("Truly");
+	if (buf[5] != 0x09)
+		return BBK_FRONT_S5K4H7("unknown");
+	if (len < 7)
+		return BBK_FRONT_S5K4H7("Truly");
+	if (buf[6] != 0xa0)
+		return BBK_FRONT_S5K4H7("unknown");
+	if (len < 0xc)
+		return BBK_FRONT_S5K4H7("Truly");
+	if (!buf[11]) {
+		if (len < 0xd)
+			return BBK_FRONT_S5K4H7("Truly");
+		if (buf[12] != 0x12)
+			return BBK_FRONT_S5K4H7("unknown");
+		if (len < 0xe)
+			return BBK_FRONT_S5K4H7("Truly");
+		if (buf[13])
+			return BBK_FRONT_S5K4H7("unknown");
+		if (len < 0xf)
+			return BBK_FRONT_S5K4H7("Truly");
+		if (buf[14])
+			return BBK_FRONT_S5K4H7("unknown");
+
+		return BBK_FRONT_S5K4H7("Truly");
+	}
+
+	return BBK_FRONT_S5K4H7("unknown");
+}
+
+/**
+ * bbk_camera_info_suffix - build the "(<module id>)" suffix
+ * @suffix: destination buffer
+ * @size:   size of @suffix
+ * @buf:    module id bytes
+ * @len:    number of valid bytes
+ *
+ * The factory firmware appends the 16 byte module id string (when the byte
+ * at offset 20 is 0x01) to the module vendor line.
+ */
+static void bbk_camera_info_suffix(char *suffix, size_t size,
+	uint8_t *buf, uint32_t len)
+{
+	char id[BBK_INFO_ID_LEN + 1];
+
+	suffix[0] = '\0';
+	if (!buf || len < BBK_INFO_ID_MIN_LEN ||
+		buf[BBK_MODULE_ID_LEN] != BBK_INFO_ID_FLAG)
+		return;
+
+	memcpy(id, &buf[BBK_INFO_ID_OFFSET], BBK_INFO_ID_LEN);
+	id[BBK_INFO_ID_LEN] = '\0';
+	snprintf(suffix, size, "(%s)", id);
+}
+
+/**
+ * bbk_camera_info_dump - print the module id/calibration bytes
+ * @m:     seq_file
+ * @buf:   module id bytes
+ * @len:   number of valid bytes
+ * @base:  first register number of the second half of the map
+ */
+static void bbk_camera_info_dump(struct seq_file *m, uint8_t *buf,
+	uint32_t len, uint32_t base)
+{
+	uint32_t i;
+
+	if (!buf)
+		return;
+
+	for (i = 0; i < len; i++) {
+		if (i < BBK_MODULE_ID_LEN)
+			seq_printf(m, "reg[0x%04x] = 0x%02x, ",
+				(unsigned int)i, (unsigned int)buf[i]);
+		else
+			seq_printf(m, "reg[0x%04x] = 0x%02x, ",
+				(unsigned int)(i + base),
+				(unsigned int)buf[i]);
+	}
+}
+
+static int back_camera_info_show(struct seq_file *m, void *v)
+{
+	char suffix[BBK_INFO_ID_LEN + 8];
+
+	bbk_camera_info_suffix(suffix, sizeof(suffix), bbk_back_info_data,
+		bbk_back_info_size);
+
+	seq_printf(m, bbk_back_info_vendor(bbk_back_info_data,
+		bbk_back_info_size), suffix);
+
+	bbk_camera_info_dump(m, bbk_back_info_data, bbk_back_info_size,
+		BBK_BACK_REG_BASE);
+
+	return 0;
+}
+
+static int front_camera_info_show(struct seq_file *m, void *v)
+{
+	char suffix[BBK_INFO_ID_LEN + 8];
+
+	bbk_camera_info_suffix(suffix, sizeof(suffix), bbk_front_info_data,
+		bbk_front_info_size);
+
+	seq_printf(m, bbk_front_info_vendor(bbk_front_info_data,
+		bbk_front_info_size), suffix);
+
+	bbk_camera_info_dump(m, bbk_front_info_data, bbk_front_info_size,
+		BBK_FRONT_REG_BASE);
+
+	return 0;
+}
+
+static int back_camera_info_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, back_camera_info_show, NULL);
+}
+
+static int front_camera_info_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, front_camera_info_show, NULL);
+}
+
+static const struct file_operations back_camera_info_fops = {
+	.owner = THIS_MODULE,
+	.open = back_camera_info_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+static const struct file_operations front_camera_info_fops = {
+	.owner = THIS_MODULE,
+	.open = front_camera_info_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+static int back_camera_info_create_proc(void)
+{
+	if (!proc_create(BBK_BACK_INFO_PROC, BBK_INFO_PROC_MODE, NULL,
+		&back_camera_info_fops)) {
+		CAM_ERR(CAM_EEPROM, "%s creat proc %s fail! %d", __func__,
+			BBK_BACK_INFO_PROC, -1);
+		return -1;
+	}
+
+	return 0;
+}
+
+static int front_camera_info_create_proc(void)
+{
+	if (!proc_create(BBK_FRONT_INFO_PROC, BBK_INFO_PROC_MODE, NULL,
+		&front_camera_info_fops)) {
+		CAM_ERR(CAM_EEPROM, "%s creat proc %s fail! %d", __func__,
+			BBK_FRONT_INFO_PROC, -1);
+		return -1;
+	}
+
+	return 0;
+}
+
+/**
+ * bbk_camera_info_setup - publish the camera module information
+ * @e_ctrl: eeprom control structure
+ *
+ * Creates /proc/driver/BackCamera_info or /proc/driver/FrontCamera_info
+ * depending on the eeprom instance and stores a copy of the EEPROM memory
+ * map that was read during probe.  The proc entries are created even when no
+ * data is available yet, so that userspace always finds them.
+ */
+static void bbk_camera_info_setup(struct cam_eeprom_ctrl_t *e_ctrl)
+{
+	uint8_t *data = e_ctrl->cal_data.mapdata;
+	uint32_t size = e_ctrl->cal_data.num_data;
+	int32_t id = e_ctrl->soc_info.pdev->id;
+
+	if (id != 0 && id != 1)
+		return;
+
+	if (data && size) {
+		uint8_t *copy = kmemdup(data, size, GFP_KERNEL);
+
+		if (!copy) {
+			CAM_ERR(CAM_EEPROM, "failed: no memory for camera info");
+			return;
+		}
+
+		if (id == 0) {
+			kfree(bbk_back_info_data);
+			bbk_back_info_data = copy;
+			bbk_back_info_size = size;
+		} else {
+			kfree(bbk_front_info_data);
+			bbk_front_info_data = copy;
+			bbk_front_info_size = size;
+		}
+	}
+
+	if (id == 0)
+		back_camera_info_create_proc();
+	else
+		front_camera_info_create_proc();
+}
+
+/**
+ * bbk_camera_info_read_module_id - read the module id out of the eeprom
+ * @e_ctrl: eeprom control structure
+ *
+ * The factory firmware powers the camera module up once during probe, reads
+ * the EEPROM memory map (module id + calibration) and feeds it to the
+ * /proc/driver/*Camera_info entries.
+ */
+static void bbk_camera_info_read_module_id(struct cam_eeprom_ctrl_t *e_ctrl)
+{
+	struct cam_eeprom_soc_private  *soc_private =
+		(struct cam_eeprom_soc_private *)e_ctrl->soc_info.soc_private;
+	struct device_node *of_node = e_ctrl->soc_info.dev->of_node;
+	uint32_t temp;
+	int32_t rc;
+
+	if (!soc_private || !of_node)
+		return;
+
+	rc = of_property_read_u32(of_node, "cell-index",
+		&e_ctrl->soc_info.pdev->id);
+	if (rc < 0)
+		CAM_DBG(CAM_EEPROM, "cell-index not found rc %d", rc);
+
+	rc = of_property_read_u32(of_node, "qcom,slave-addr", &temp);
+	if (!rc) {
+		soc_private->i2c_info.slave_addr = temp;
+		rc = of_property_read_u32(of_node, "qcom,i2c-freq-mode", &temp);
+		if (!rc)
+			soc_private->i2c_info.i2c_freq_mode = temp;
+		else
+			CAM_DBG(CAM_EEPROM, "qcom,i2c-freq-mode rc %d", rc);
+	} else {
+		CAM_DBG(CAM_EEPROM, "qcom,slave-addr rc %d", rc);
+	}
+
+	CAM_ERR(CAM_EEPROM,
+		"KERNEL_CHECK_MODULE_ID e_ctrl->soc_info.pdev->id: %d, slave-addr: 0x%x, i2c-freq-mode: %d",
+		e_ctrl->soc_info.pdev->id, soc_private->i2c_info.slave_addr,
+		soc_private->i2c_info.i2c_freq_mode);
+
+	rc = cam_eeprom_update_i2c_info(e_ctrl, &soc_private->i2c_info);
+	if (rc)
+		CAM_ERR(CAM_EEPROM, "failed: to update i2c info rc %d", rc);
+
+	rc = cam_get_dt_power_setting_data(of_node, &e_ctrl->soc_info,
+		&soc_private->power_info);
+	if (rc < 0)
+		CAM_ERR(CAM_EEPROM,
+			"KERNEL_CHECK_MODULE_ID failed in getting power settings");
+
+	rc = cam_eeprom_parse_read_memory_map(of_node, e_ctrl);
+	if (rc < 0) {
+		CAM_ERR(CAM_EEPROM,
+			"KERNEL_CHECK_MODULE_ID Failed: rc : %d", rc);
+		bbk_camera_info_setup(e_ctrl);
+		return;
+	}
+
+	bbk_camera_info_setup(e_ctrl);
+
+	vfree(e_ctrl->cal_data.mapdata);
+	vfree(e_ctrl->cal_data.map);
+	e_ctrl->cal_data.mapdata = NULL;
+	e_ctrl->cal_data.map = NULL;
+	e_ctrl->cal_data.num_data = 0;
+	e_ctrl->cal_data.num_map = 0;
+
+	CAM_INFO(CAM_EEPROM, "KERNEL_CHECK_MODULE_ID Done");
 }
 
 #ifdef CONFIG_COMPAT
@@ -460,6 +1019,9 @@ static int32_t cam_eeprom_platform_driver_probe(
 		CAM_ERR(CAM_EEPROM, "failed: to update i2c info rc %d", rc);
 		goto free_soc;
 	}
+
+	/* EEBBK: read the camera module id and publish it through /proc */
+	bbk_camera_info_read_module_id(e_ctrl);
 
 	rc = cam_eeprom_init_subdev(e_ctrl);
 	if (rc)
