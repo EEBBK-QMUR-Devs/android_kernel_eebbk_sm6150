@@ -37,15 +37,28 @@
 #include <linux/of_device.h>
 #include <linux/of_gpio.h>
 #include <linux/of_irq.h>
-#if defined(CONFIG_FB)
+/*
+ * EEBBK S6 (P20H130) fix:
+ * This kernel has CONFIG_FB=y *and* CONFIG_DRM=y, while the display is driven
+ * by MSM DRM (SDE).  The original "#if defined(CONFIG_FB)" therefore registered
+ * the legacy fb_notifier, which an MSM DRM display never fires, so
+ * fts_ts_suspend()/fts_ts_resume() were never called.  With the screen off the
+ * touch controller stayed awake with its IRQ enabled, which produced an
+ * interrupt storm (system extremely laggy after locking) and bogus touch
+ * reports.
+ *
+ * Other drivers in this tree use the MSM DRM client for this display
+ * (hxchipset/himax_common.c: "#ifdef CONFIG_DRM ... msm_drm_register_client"),
+ * and st/fts.c only takes the fb path when CONFIG_FB_MSM (legacy MSM
+ * framebuffer) is set.  Apply the same rule here.
+ */
+#if defined(CONFIG_FB_MSM)
 #include <linux/notifier.h>
 #include <linux/fb.h>
-#elif defined(CONFIG_DRM)
-#if defined(CONFIG_DRM_PANEL)
-#include <drm/drm_panel.h>
-#else
+#elif defined(CONFIG_DRM) || defined(CONFIG_MSM_DRM)
+/* this display is MSM DRM (SDE): it notifies via the msm_drm chain */
+#include <linux/notifier.h>
 #include <linux/msm_drm_notify.h>
-#endif
 #elif defined(CONFIG_HAS_EARLYSUSPEND)
 #include <linux/earlysuspend.h>
 #define FTS_SUSPEND_LEVEL 1     /* Early-suspend level */
@@ -1494,7 +1507,7 @@ static void fts_resume_work(struct work_struct *work)
     fts_ts_resume(ts_data->dev);
 }
 
-#if defined(CONFIG_FB)
+#if defined(CONFIG_FB_MSM)
 static int fb_notifier_callback(struct notifier_block *self,
                                 unsigned long event, void *data)
 {
@@ -1538,8 +1551,9 @@ static int fb_notifier_callback(struct notifier_block *self,
 
     return 0;
 }
-#elif defined(CONFIG_DRM)
-#if defined(CONFIG_DRM_PANEL)
+#elif defined(CONFIG_DRM) || defined(CONFIG_MSM_DRM)
+#if 0 /* EEBBK S6: the MSM DRM display never emits DRM_PANEL blank
+         * events - use the MSM_DRM callback of the #else branch */
 static struct drm_panel *active_panel;
 
 static int drm_check_dt(struct device_node *np)
@@ -1824,26 +1838,21 @@ static int fts_ts_probe_entry(struct fts_ts_data *ts_data)
     ts_data->pm_suspend = false;
 #endif
 
-#if defined(CONFIG_FB)
+#if defined(CONFIG_FB_MSM)
     ts_data->fb_notif.notifier_call = fb_notifier_callback;
     ret = fb_register_client(&ts_data->fb_notif);
     if (ret) {
         FTS_ERROR("[FB]Unable to register fb_notifier: %d", ret);
     }
-#elif defined(CONFIG_DRM)
+#elif defined(CONFIG_DRM) || defined(CONFIG_MSM_DRM)
     ts_data->fb_notif.notifier_call = drm_notifier_callback;
-#if defined(CONFIG_DRM_PANEL)
-    if (active_panel) {
-        ret = drm_panel_notifier_register(active_panel, &ts_data->fb_notif);
-        if (ret)
-            FTS_ERROR("[DRM]drm_panel_notifier_register fail: %d\n", ret);
-    }
-#else
+    /* EEBBK S6: register the MSM DRM client (the drm_panel notifier
+     * used before is never notified on this display) */
     ret = msm_drm_register_client(&ts_data->fb_notif);
-    if (ret) {
-        FTS_ERROR("[DRM]Unable to register fb_notifier: %d\n", ret);
-    }
-#endif
+    if (ret)
+        FTS_ERROR("[DRM]Unable to register msm_drm notifier: %d\n", ret);
+    else
+        FTS_INFO("[DRM]msm_drm notifier registered for blank/unblank");
 #elif defined(CONFIG_HAS_EARLYSUSPEND)
     ts_data->early_suspend.level = EARLY_SUSPEND_LEVEL_BLANK_SCREEN + FTS_SUSPEND_LEVEL;
     ts_data->early_suspend.suspend = fts_ts_early_suspend;
@@ -1914,17 +1923,12 @@ static int fts_ts_remove_entry(struct fts_ts_data *ts_data)
     if (ts_data->ts_workqueue)
         destroy_workqueue(ts_data->ts_workqueue);
 
-#if defined(CONFIG_FB)
+#if defined(CONFIG_FB_MSM)
     if (fb_unregister_client(&ts_data->fb_notif))
         FTS_ERROR("[FB]Error occurred while unregistering fb_notifier.");
-#elif defined(CONFIG_DRM)
-#if defined(CONFIG_DRM_PANEL)
-    if (active_panel)
-        drm_panel_notifier_unregister(active_panel, &ts_data->fb_notif);
-#else
+#elif defined(CONFIG_DRM) || defined(CONFIG_MSM_DRM)
     if (msm_drm_unregister_client(&ts_data->fb_notif))
-        FTS_ERROR("[DRM]Error occurred while unregistering fb_notifier.\n");
-#endif
+        FTS_ERROR("[DRM]Error unregistering msm_drm notifier.\n");
 #elif defined(CONFIG_HAS_EARLYSUSPEND)
     unregister_early_suspend(&ts_data->early_suspend);
 #endif
