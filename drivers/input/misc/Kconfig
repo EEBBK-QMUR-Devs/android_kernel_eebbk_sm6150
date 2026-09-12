@@ -890,3 +890,13 @@ config INPUT_HISI_POWERKEY
 	  module will be called hisi_powerkey.
 
 endif
+
+config INPUT_IST8801
+	bool "iSentek IST8801 3D hall switch"
+	depends on I2C
+	help
+	  Say Y here to support the iSentek IST8801 3D hall-effect switch used as
+	  the BBK hall sensor (dt: isentek,ist8801-0/-1/-2).
+
+	  The driver was reconstructed from the vendor kernel binary because the
+	  vendor sources are not part of this tree.

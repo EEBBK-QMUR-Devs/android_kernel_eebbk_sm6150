@@ -1,0 +1,449 @@
+/*
+ * iSentek IST8801 3D hall-effect switch driver for the EEBBK S6 (P20H130).
+ *
+ * Reconstructed from the vendor kernel binary in the factory boot image: the
+ * vendor source of this driver is not part of this tree, so the register map
+ * and the access protocol were recovered by disassembling the factory Image
+ * (its kallsyms still carries the symbol names).
+ *
+ * Recovered symbols
+ *   ist8801_i2c_probe, ist8801_i2c_read_block, ist8801_set_operation_mode,
+ *   ist8801_set_detection_mode, ist8801_hall_enable, ist8801_hall_getdata,
+ *   ist8801_get_data, ist8801_get_id, ist8801_reset_device,
+ *   ist8801_dump_reg, ist8801_i2c_suspend/resume, ist8801_ranges_1/_2
+ *
+ * I2C protocol
+ *   write: buf[0] = reg, buf[1] = value, i2c_master_send(client, buf, 2),
+ *          serialised by the global ist8801_i2c_mutex.
+ *   read : ist8801_i2c_read_block(data, reg, buf, len), len <= 0x11,
+ *          i2c_transfer with {addr,0,1,&reg} then {addr,I2C_M_RD,len,buf}.
+ *
+ * Register map (addresses seen in the disassembly)
+ *   0x01  control             written 0x00 (also on the reset path)
+ *   0x07  control             written 0x01
+ *   0x08  operation mode      written 0x00 powerdown / 0x40 mode / 0x80 start
+ *   0x09  device id           read twice with msleep(20) in between
+ *   0x10  5-byte data block   "ist8801: data [%02X, %02X, %02X, %02X, %02X]"
+ *   0x20  control             written 0x00 / 0x02
+ *   0x40  status/mode         read 1 byte before and after a measurement
+ *   0x54  status              read 1 byte
+ *   0x00..0x13                dumped by ist8801_dump_reg
+ *
+ * Data path
+ *   ist8801_hall_enable -> set_detection_mode + set_operation_mode
+ *   ist8801_hall_getdata: read 0x40; write {0x08,0x80};
+ *                         usleep_range(2000, 2500); read 5 bytes @0x10;
+ *                         read 0x40 again; log "z=%6d, zc=%6d, t=%6d, t25=%6d"
+ *
+ * SPDX-License-Identifier: GPL-2.0
+ */
+#include <linux/module.h>
+#include <linux/i2c.h>
+#include <linux/of.h>
+#include <linux/of_device.h>
+#include <linux/slab.h>
+#include <linux/delay.h>
+#include <linux/mutex.h>
+#include <linux/sysfs.h>
+#include <linux/string.h>
+
+#define IST8801_DRV_NAME	"ist8801"
+
+#define IST8801_REG_CTRL1	0x01
+#define IST8801_REG_CTRL2	0x07
+#define IST8801_REG_OPMODE	0x08
+#define IST8801_REG_DID		0x09
+#define IST8801_REG_DATA	0x10
+#define IST8801_REG_CTRL3	0x20
+#define IST8801_REG_STATUS1	0x40
+#define IST8801_REG_STATUS2	0x54
+
+#define IST8801_OP_POWERDOWN	0x00
+#define IST8801_OP_MODE		0x40
+#define IST8801_OP_START	0x80
+
+#define IST8801_DATA_LEN	5
+#define IST8801_MAX_RD		0x11
+
+struct ist8801_data {
+	struct i2c_client	*client;
+	struct device		*dev;
+	struct mutex		lock;
+	u8			did;
+	bool			enabled;
+	unsigned int		delay_ms;
+	u32			data_range;
+	u32			bias_support;
+	u32			bias_ratio;
+	char			line[128];
+};
+
+static DEFINE_MUTEX(ist8801_i2c_mutex);
+
+static int ist8801_i2c_read_block(struct ist8801_data *d, u8 reg, u8 *buf, u16 len)
+{
+	struct i2c_msg msgs[2];
+	int ret;
+
+	if (!d || !d->client)
+		return -EINVAL;
+	if (!len || len > IST8801_MAX_RD) {
+		dev_err(d->dev, "%s: bad length %u\n", __func__, len);
+		return -EINVAL;
+	}
+
+	mutex_lock(&ist8801_i2c_mutex);
+	msgs[0].addr = d->client->addr;
+	msgs[0].flags = 0;
+	msgs[0].len = 1;
+	msgs[0].buf = &reg;
+	msgs[1].addr = d->client->addr;
+	msgs[1].flags = I2C_M_RD;
+	msgs[1].len = len;
+	msgs[1].buf = buf;
+	ret = i2c_transfer(d->client->adapter, msgs, 2);
+	mutex_unlock(&ist8801_i2c_mutex);
+
+	if (ret < 0) {
+		dev_err(d->dev, "%s: i2c read reg 0x%02x failed (%d)\n",
+			__func__, reg, ret);
+		return -EIO;
+	}
+	return 0;
+}
+
+static int ist8801_i2c_write_block(struct ist8801_data *d, u8 reg, u8 val)
+{
+	u8 buf[2] = { reg, val };
+	int ret;
+
+	if (!d || !d->client)
+		return -EINVAL;
+
+	mutex_lock(&ist8801_i2c_mutex);
+	ret = i2c_master_send(d->client, buf, sizeof(buf));
+	mutex_unlock(&ist8801_i2c_mutex);
+
+	if (ret < 0) {
+		dev_err(d->dev, "%s: i2c write 0x%02x=0x%02x failed (%d)\n",
+			__func__, reg, val, ret);
+		return -EIO;
+	}
+	return 0;
+}
+
+static int ist8801_reset_device(struct ist8801_data *d)
+{
+	int ret = ist8801_i2c_write_block(d, IST8801_REG_CTRL1, 0x00);
+
+	msleep(20);	/* the factory probe sleeps 20ms before re-reading the id */
+	return ret;
+}
+
+static int ist8801_get_id(struct ist8801_data *d, u8 *id)
+{
+	return ist8801_i2c_read_block(d, IST8801_REG_DID, id, 1);
+}
+
+static int ist8801_set_operation_mode(struct ist8801_data *d, u8 op)
+{
+	int ret;
+
+	switch (op) {
+	case IST8801_OP_START:
+		ret = ist8801_i2c_write_block(d, IST8801_REG_OPMODE, IST8801_OP_START);
+		break;
+	case IST8801_OP_MODE:
+		ret = ist8801_i2c_write_block(d, IST8801_REG_OPMODE, IST8801_OP_MODE);
+		if (!ret)
+			ret = ist8801_i2c_write_block(d, IST8801_REG_CTRL3, 0x02);
+		break;
+	default:
+		ret = ist8801_i2c_write_block(d, IST8801_REG_OPMODE, IST8801_OP_POWERDOWN);
+		if (!ret)
+			ret = ist8801_i2c_write_block(d, IST8801_REG_CTRL3, 0x00);
+		break;
+	}
+	return ret;
+}
+
+static int ist8801_set_detection_mode(struct ist8801_data *d, bool enable)
+{
+	return ist8801_i2c_write_block(d, IST8801_REG_CTRL1, enable ? 0x01 : 0x00);
+}
+
+static int ist8801_get_data(struct ist8801_data *d, u8 *raw)
+{
+	int ret;
+
+	ret = ist8801_i2c_read_block(d, IST8801_REG_STATUS1, raw, 1);
+	if (ret)
+		return ret;
+
+	ret = ist8801_set_operation_mode(d, IST8801_OP_START);
+	if (ret)
+		return ret;
+
+	usleep_range(2000, 2500);
+
+	ret = ist8801_i2c_read_block(d, IST8801_REG_DATA, raw, IST8801_DATA_LEN);
+	if (ret)
+		return ret;
+
+	dev_dbg(d->dev, "%s: data [%02X, %02X, %02X, %02X, %02X]\n", __func__,
+		raw[0], raw[1], raw[2], raw[3], raw[4]);
+
+	if (!(raw[0] & 0x01))
+		dev_dbg(d->dev, "%s: st1(0x%02X) is not DRDY.\n", __func__, raw[0]);
+
+	return 0;
+}
+
+/* one full sample, formatted the way the factory driver formatted it */
+static int ist8801_refresh(struct ist8801_data *d)
+{
+	u8 raw[IST8801_DATA_LEN];
+	u8 st2 = 0;
+	s16 z, t;
+	int ret;
+
+	mutex_lock(&d->lock);
+	ret = ist8801_get_data(d, raw);
+	mutex_unlock(&d->lock);
+	if (ret)
+		return ret;
+
+	z = (s16)((raw[2] << 8) | raw[1]);
+	t = (s16)((raw[4] << 8) | raw[3]);
+
+	ist8801_i2c_read_block(d, IST8801_REG_STATUS2, &st2, 1);
+
+	scnprintf(d->line, sizeof(d->line),
+		  "ist8801 [%x], z=%6d, zc=%6d, t=%6d, t25=%6d.",
+		  d->client->addr, z, z, t, t);
+	return 0;
+}
+
+static ssize_t data_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct ist8801_data *d = dev_get_drvdata(dev);
+
+	ist8801_refresh(d);
+	return scnprintf(buf, PAGE_SIZE, "%s\n", d->line);
+}
+
+static ssize_t enable_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct ist8801_data *d = dev_get_drvdata(dev);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", d->enabled ? 1 : 0);
+}
+
+static ssize_t enable_store(struct device *dev, struct device_attribute *attr,
+			    const char *buf, size_t count)
+{
+	struct ist8801_data *d = dev_get_drvdata(dev);
+	unsigned long v;
+
+	if (kstrtoul(buf, 0, &v))
+		return -EINVAL;
+
+	mutex_lock(&d->lock);
+	d->enabled = !!v;
+	ist8801_set_detection_mode(d, d->enabled);
+	ist8801_set_operation_mode(d, d->enabled ? IST8801_OP_MODE
+						 : IST8801_OP_POWERDOWN);
+	mutex_unlock(&d->lock);
+	return count;
+}
+
+static ssize_t delay_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct ist8801_data *d = dev_get_drvdata(dev);
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", d->delay_ms);
+}
+
+static ssize_t delay_store(struct device *dev, struct device_attribute *attr,
+			   const char *buf, size_t count)
+{
+	struct ist8801_data *d = dev_get_drvdata(dev);
+	unsigned long v;
+
+	if (kstrtoul(buf, 0, &v))
+		return -EINVAL;
+	d->delay_ms = (unsigned int)v;
+	return count;
+}
+
+static ssize_t vendor_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	return scnprintf(buf, PAGE_SIZE, "isentek\n");
+}
+
+static DEVICE_ATTR_RO(data);
+static DEVICE_ATTR_RW(enable);
+static DEVICE_ATTR_RW(delay);
+static DEVICE_ATTR_RO(vendor);
+
+static struct attribute *ist8801_attrs[] = {
+	&dev_attr_data.attr,
+	&dev_attr_enable.attr,
+	&dev_attr_delay.attr,
+	&dev_attr_vendor.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(ist8801);
+
+static int ist8801_parse_dt(struct ist8801_data *d)
+{
+	struct device_node *np = d->dev->of_node;
+	u32 v;
+
+	d->delay_ms = 100;
+	d->data_range = 0;
+
+	if (np && !of_property_read_u32(np, "data-range", &v))
+		d->data_range = v;
+	if (np && !of_property_read_u32(np, "hall,bias_support", &v))
+		d->bias_support = v;
+	if (np && !of_property_read_u32(np, "hall,bias-ratio", &v))
+		d->bias_ratio = v;
+	else
+		d->bias_ratio = 0x5a;
+
+	dev_info(d->dev, "%s : data-range is 0x%x\n", __func__, d->data_range);
+	return 0;
+}
+
+static int ist8801_i2c_probe(struct i2c_client *client,
+			     const struct i2c_device_id *id)
+{
+	struct ist8801_data *d;
+	u8 did = 0;
+	int ret;
+
+	d = devm_kzalloc(&client->dev, sizeof(*d), GFP_KERNEL);
+	if (!d)
+		return -ENOMEM;
+
+	d->client = client;
+	d->dev = &client->dev;
+	mutex_init(&d->lock);
+	i2c_set_clientdata(client, d);
+	dev_set_drvdata(&client->dev, d);
+	strlcpy(d->line, "ist8801: no data yet", sizeof(d->line));
+
+	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C)) {
+		dev_err(d->dev, "%s : i2c_check_functionality was failed\n", __func__);
+		return -EOPNOTSUPP;
+	}
+
+	ist8801_parse_dt(d);
+
+	ret = ist8801_reset_device(d);
+	if (ret) {
+		dev_err(d->dev, "%s : ist8801_reset_device fail\n", __func__);
+		return ret;
+	}
+
+	ret = ist8801_get_id(d, &did);
+	if (ret) {
+		dev_err(d->dev, "%s : read IST8801_REG_DID failed(%d)\n",
+			__func__, ret);
+		return ret;
+	}
+	d->did = did;
+
+	dev_info(d->dev, "%s: ist8801 at 0x%02x, device id 0x%02x\n",
+		 __func__, client->addr, did);
+
+	ret = devm_device_add_groups(d->dev, ist8801_groups);
+	if (ret) {
+		dev_err(d->dev, "%s: sysfs_create_group failed(%d)\n", __func__, ret);
+		return ret;
+	}
+
+	d->enabled = true;
+	ist8801_set_detection_mode(d, true);
+	ist8801_set_operation_mode(d, IST8801_OP_MODE);
+	ist8801_refresh(d);
+	dev_info(d->dev, "%s: %s\n", __func__, d->line);
+
+	return 0;
+}
+
+static int ist8801_i2c_remove(struct i2c_client *client)
+{
+	struct ist8801_data *d = i2c_get_clientdata(client);
+
+	if (!d)
+		return 0;
+	mutex_lock(&d->lock);
+	d->enabled = false;
+	ist8801_set_operation_mode(d, IST8801_OP_POWERDOWN);
+	mutex_unlock(&d->lock);
+	return 0;
+}
+
+static int ist8801_i2c_suspend(struct device *dev)
+{
+	struct ist8801_data *d = dev_get_drvdata(dev);
+
+	if (!d)
+		return 0;
+	mutex_lock(&d->lock);
+	ist8801_set_operation_mode(d, IST8801_OP_POWERDOWN);
+	mutex_unlock(&d->lock);
+	return 0;
+}
+
+static int ist8801_i2c_resume(struct device *dev)
+{
+	struct ist8801_data *d = dev_get_drvdata(dev);
+
+	if (!d)
+		return 0;
+	mutex_lock(&d->lock);
+	if (d->enabled)
+		ist8801_set_operation_mode(d, IST8801_OP_MODE);
+	mutex_unlock(&d->lock);
+	return 0;
+}
+
+static const struct dev_pm_ops ist8801_pm_ops = {
+	SET_SYSTEM_SLEEP_PM_OPS(ist8801_i2c_suspend, ist8801_i2c_resume)
+};
+
+static const struct of_device_id ist8801_match[] = {
+	{ .compatible = "isentek,ist8801-0" },
+	{ .compatible = "isentek,ist8801-1" },
+	{ .compatible = "isentek,ist8801-2" },
+	{ }
+};
+MODULE_DEVICE_TABLE(of, ist8801_match);
+
+static const struct i2c_device_id ist8801_id[] = {
+	{ "ist8801_0", 0 },
+	{ "ist8801_1", 1 },
+	{ "ist8801_2", 2 },
+	{ }
+};
+MODULE_DEVICE_TABLE(i2c, ist8801_id);
+
+static struct i2c_driver ist8801_i2c_driver = {
+	.driver = {
+		.name		= IST8801_DRV_NAME,
+		.owner		= THIS_MODULE,
+		.pm		= &ist8801_pm_ops,
+		.of_match_table	= of_match_ptr(ist8801_match),
+	},
+	.probe		= ist8801_i2c_probe,
+	.remove		= ist8801_i2c_remove,
+	.id_table	= ist8801_id,
+};
+module_i2c_driver(ist8801_i2c_driver);
+
+MODULE_AUTHOR("EEBBK S6 kernel reconstruction");
+MODULE_DESCRIPTION("iSentek IST8801 3D hall switch (reconstructed from the factory binary)");
+MODULE_LICENSE("GPL v2");
