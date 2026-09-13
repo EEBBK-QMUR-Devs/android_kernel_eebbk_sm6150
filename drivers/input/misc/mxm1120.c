@@ -61,6 +61,27 @@
 #include <linux/workqueue.h>
 #include <linux/regulator/consumer.h>
 
+/*
+ * The BBK hall framework.  Its header is not part of this tree, so the two
+ * structures the registration protocol needs are declared here, with the layout
+ * recovered from the factory binary: hall_ops is {get_data, set_enable} and
+ * hall_dev is {char name[24]; struct hall_ops *ops; void *data;}, and the name
+ * must start with "up" or "down" for the framework to accept it.
+ */
+struct hall_ops {
+	int (*get_data)(void *data, s16 *value);
+	int (*set_enable)(void *data, int on);
+};
+
+struct hall_dev {
+	char		name[24];
+	struct hall_ops	*ops;
+	void		*data;
+};
+
+extern int bbk_hall_core_register_device(struct hall_dev *dev);
+extern void bbk_hall_core_unregister_device(struct hall_dev *dev);
+
 #define M1120_DRV_NAME		"mxm1120"
 
 #define M1120_REG_ID		0x00
@@ -98,6 +119,9 @@ struct m1120_data {
 	unsigned int		delay_ms;
 	char			line[128];
 	s16			last;
+	/* the BBK hall framework registration */
+	struct hall_ops		hall_ops;
+	struct hall_dev		hall;
 };
 
 static int m1120_i2c_set_reg(struct m1120_data *d, u8 reg, u8 val)
@@ -249,6 +273,74 @@ static void m1120_work(struct work_struct *work)
 	if (d->enabled)
 		schedule_delayed_work(&d->work, msecs_to_jiffies(d->delay_ms));
 	mutex_unlock(&d->lock);
+}
+
+/* ------------------------------------------------ BBK hall framework ops -- */
+
+/*
+ * [RE] the framework calls get_data() to take one sample and set_enable() to
+ * turn the sensor on and off; both take the hall_dev's data pointer, which is
+ * this driver's private data.
+ */
+static int m1120_hall_get_data(void *data, s16 *value)
+{
+	struct m1120_data *d = data;
+	int ret;
+
+	if (!d || !value)
+		return -EINVAL;
+	mutex_lock(&d->lock);
+	ret = m1120_measure(d, value);
+	if (!ret) {
+		d->last = *value;
+		scnprintf(d->line, sizeof(d->line), "m1120 [%s] raw = %d\n",
+			  d->pos == M1120_POS_UP ? "up" :
+			  (d->pos == M1120_POS_DOWN ? "down" : "middle"), *value);
+	}
+	mutex_unlock(&d->lock);
+	return ret;
+}
+
+static int m1120_hall_set_enable(void *data, int on)
+{
+	struct m1120_data *d = data;
+
+	if (!d)
+		return -EINVAL;
+	mutex_lock(&d->lock);
+	d->enabled = !!on;
+	if (d->enabled) {
+		m1120_set_operation_mode(d, true);
+		schedule_delayed_work(&d->work, 0);
+	} else {
+		cancel_delayed_work(&d->work);
+		m1120_set_operation_mode(d, false);
+	}
+	mutex_unlock(&d->lock);
+	return 0;
+}
+
+/*
+ * Register with the framework.  The factory DT names the two instances
+ * "magnachip,mxm1120,up" and "magnachip,mxm1120,down", and the factory driver
+ * registered them as the framework's up and down sensors, so the name is taken
+ * from the device tree compatible.
+ */
+static int m1120_hall_register(struct m1120_data *d)
+{
+	d->hall_ops.get_data = m1120_hall_get_data;
+	d->hall_ops.set_enable = m1120_hall_set_enable;
+	d->hall.ops = &d->hall_ops;
+	d->hall.data = d;
+
+	if (d->pos == M1120_POS_UP)
+		strlcpy(d->hall.name, "up-mxm1120", sizeof(d->hall.name));
+	else if (d->pos == M1120_POS_DOWN)
+		strlcpy(d->hall.name, "down-mxm1120", sizeof(d->hall.name));
+	else
+		strlcpy(d->hall.name, "mid-mxm1120", sizeof(d->hall.name));
+
+	return bbk_hall_core_register_device(&d->hall);
 }
 
 /* ------------------------------------------------------------------ sysfs -- */
@@ -479,6 +571,12 @@ static int m1120_i2c_drv_probe(struct i2c_client *client,
 
 	d->enabled = true;
 	schedule_delayed_work(&d->work, msecs_to_jiffies(d->delay_ms));
+
+	ret = m1120_hall_register(d);
+	if (ret)
+		dev_err(d->dev, "%s: hall framework registration failed (%d)\n",
+			__func__, ret);
+
 	dev_info(d->dev, "%s: %s-%s was found\n", __func__,
 		 d->pos == M1120_POS_UP ? "up" : (d->pos == M1120_POS_DOWN ? "down" : "middle"),
 		 M1120_DRV_NAME);
@@ -498,6 +596,7 @@ static int m1120_i2c_drv_remove(struct i2c_client *client)
 
 	if (!d)
 		return 0;
+	bbk_hall_core_unregister_device(&d->hall);
 	d->enabled = false;
 	cancel_delayed_work_sync(&d->work);
 	if (d->vddio)

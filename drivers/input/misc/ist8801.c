@@ -46,6 +46,10 @@
 #include <linux/mutex.h>
 #include <linux/sysfs.h>
 #include <linux/string.h>
+#include <linux/of.h>
+
+/* [RE] the legacy text based BBK framework entry point */
+extern int dhall_register_hall(char *name, void *ops, void *data);
 
 #define IST8801_DRV_NAME	"ist8801"
 
@@ -369,6 +373,31 @@ static int ist8801_i2c_probe(struct i2c_client *client,
 	ist8801_set_operation_mode(d, IST8801_OP_MODE);
 	ist8801_refresh(d);
 	dev_info(d->dev, "%s: %s\n", __func__, d->line);
+
+	/*
+	 * [RE] the factory IST8801 driver registered with the older text based
+	 * framework, dhall_register_hall(), while the MXM1120 pair registered
+	 * through bbk_hall_core_register_device() as the framework's up and down
+	 * sensors (their device tree compatibles literally say up and down).
+	 * Those IST8801 instances are the 3D hall switches, so this driver keeps
+	 * the same split: announce ourselves to the legacy path, and leave the
+	 * up/down slots to the endpoint sensors.
+	 */
+	if (client->dev.of_node) {
+		const char *compat = NULL;
+
+		if (of_device_is_compatible(client->dev.of_node, "isentek,ist8801-0"))
+			compat = "up-ist8801";
+		else if (of_device_is_compatible(client->dev.of_node, "isentek,ist8801-2"))
+			compat = "down-ist8801";
+		else if (of_device_is_compatible(client->dev.of_node, "isentek,ist8801-1"))
+			compat = "mid-ist8801";
+
+		if (compat) {
+			dhall_register_hall((char *)compat, NULL, d);
+			dev_info(d->dev, "%s: registered as %s\n", __func__, compat);
+		}
+	}
 
 	return 0;
 }

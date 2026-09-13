@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config INPUT_HALL
+	tristate "BBK hall sensor framework"
+	depends on INPUT
+	help
+	  Say Y here to support the BBK hall sensor framework used by the EEBBK S6
+	  (P20H130) to position its elevator camera.  It polls the up and the down
+	  hall sensor, keeps their recent samples, detects a mechanism that is
+	  pushed by hand, and carries the calibration data that the Android daemon
+	  writes through /dev/bbk_hall_core.
+
+	  The driver was reconstructed from the vendor kernel binary because the
+	  vendor sources are not part of this tree.
