@@ -395,7 +395,6 @@ static void vib_pwm_set_clock(struct vib_pwm *d)
 static int vib_pwm_set_camera_state(struct vib_pwm *d)
 {
 	ktime_t when;
-	int ret;
 
 	dev_info(d->dev, "%s: enable %d, time %u, freq %lu\n", __func__,
 		 d->enable, d->time_ms, d->freq);
@@ -457,7 +456,6 @@ static int vib_pwm_set_camera_state(struct vib_pwm *d)
 static void vib_pwm_stage2(struct vib_pwm *d)
 {
 	unsigned int ms;
-	int ret;
 
 	d->freq = VIB_PWM_FREQ_STAGE2;
 	vib_pwm_set_clock(d);
