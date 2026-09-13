@@ -639,9 +639,29 @@ int cam_sensor_match_id(struct cam_sensor_ctrl_t *s_ctrl)
 	CAM_DBG(CAM_SENSOR, "read id: 0x%x expected id 0x%x:",
 			 chipid, slave_info->sensor_id);
 	if (cam_sensor_id_by_mask(s_ctrl, chipid) != slave_info->sensor_id) {
-		CAM_ERR(CAM_SENSOR, "chip id %x does not match %x",
-				chipid, slave_info->sensor_id);
-		return -ENODEV;
+		/*
+		 * EEBBK S6 (P20H130): the userspace declares a single byte id for
+		 * the front camera (ov16a10: sensor_id 0x56) while its id register
+		 * reads back 0x5616 over the word sized read this driver performs.
+		 * The factory driver passes the address and data types that
+		 * userspace specifies (addr_type/data_type of the sensor board
+		 * info), so the same register yields 0x56 there and the probe
+		 * succeeds; with the hardcoded word read the comparison failed and
+		 * the front camera never finished probing, which is why only the
+		 * rear camera reached the camera provider.
+		 *
+		 * Accept the leading byte of the read value as well: for the front
+		 * sensor 0x5616 >> 8 is 0x56, which is exactly what was declared.
+		 */
+		if ((chipid >> 8) != slave_info->sensor_id &&
+		    (chipid & 0xff) != slave_info->sensor_id) {
+			CAM_ERR(CAM_SENSOR, "chip id %x does not match %x",
+					chipid, slave_info->sensor_id);
+			return -ENODEV;
+		}
+		CAM_INFO(CAM_SENSOR,
+			 "chip id %x matched by its leading byte, expected %x",
+			 chipid, slave_info->sensor_id);
 	}
 	return rc;
 }
