@@ -84,20 +84,22 @@ extern void bbk_hall_core_unregister_device(struct hall_dev *dev);
 
 #define M1120_DRV_NAME		"mxm1120"
 
-#define M1120_REG_ID		0x00
+#define M1120_REG_CMD		0x00
+#define M1120_REG_CHIPID	0x09
 #define M1120_REG_CTRL1		0x01
 #define M1120_REG_CTRL2		0x07
 #define M1120_REG_OPMODE	0x08
 #define M1120_REG_DATA		0x10
 
 /*
- * [RE] the factory driver's own id check compared against this value; on the
- * device both instances (i2c 0x0c and 0x0f) answer 0x41, which is what the
- * driver must accept.  A different value is only reported, because the part
- * may be a variant of the same family.
+ * [RE] the factory probe reads one byte from register 0x09 and refuses the
+ * part unless it is 0x9c; both instances on this board (i2c 0x0c and 0x0f)
+ * answer 0x9c, which is what the earlier reconstruction got wrong when it
+ * looked at register 0x00 instead.
  */
-#define M1120_ID_EXPECT		0x41
+#define M1120_ID_EXPECT		0x9c
 #define M1120_DATA_LEN		3
+#define M1120_DUMP_LEN		0x14
 #define M1120_OP_MEASUREMENT	0x40
 
 enum m1120_pos {
@@ -165,7 +167,7 @@ static int m1120_read_block(struct m1120_data *d, u8 reg, u8 len, u8 *buf)
 
 static int m1120_get_id(struct m1120_data *d, u8 *id)
 {
-	return m1120_read_block(d, M1120_REG_ID, 1, id);
+	return m1120_read_block(d, M1120_REG_CHIPID, 1, id);
 }
 
 static int m1120_init_device(struct m1120_data *d)
@@ -186,7 +188,7 @@ static int m1120_init_device(struct m1120_data *d)
 			 "%s: device id 0x%02X, expected 0x%02X, continuing\n",
 			 __func__, d->device_id, M1120_ID_EXPECT);
 
-	ret = m1120_i2c_set_reg(d, M1120_REG_ID, 0x40);
+	ret = m1120_i2c_set_reg(d, M1120_REG_CMD, 0x40);
 	if (ret)
 		return ret;
 	ret = m1120_i2c_set_reg(d, M1120_REG_CTRL1, 0x00);
@@ -223,36 +225,43 @@ static int m1120_set_operation_mode(struct m1120_data *d, bool measure)
 	return m1120_i2c_set_reg(d, M1120_REG_OPMODE, v);
 }
 
-/* one measurement; returns the signed field value in *value */
+/*
+ * One measurement.  [RE] m1120_measure in the factory kernel reads three bytes
+ * from register 0x10 and refuses the sample unless bit 0 of the first byte is
+ * set; the caller turns that refusal into the value -2000.  The reading is
+ * buf[1] plus bit 8 taken from the top bits of buf[2], sign extended from bit 9
+ * in the 10 bit mode and a plain signed byte of buf[1] in the 8 bit mode.
+ *
+ * Reading the high bits from register 0x00 instead - as this driver first did -
+ * returns a constant: register 0x00 holds 0x40, so every sample decoded to 256.
+ */
 static int m1120_measure(struct m1120_data *d, s16 *value)
 {
 	u8 buf[M1120_DATA_LEN];
-	u8 extra = 0;
 	int v;
-
 	int ret = m1120_read_block(d, M1120_REG_DATA, M1120_DATA_LEN, buf);
+
 	if (ret)
 		return ret;
 
-	/* [RE] "damon st1(0x%02X) is not DRDY" - bit 0 of the status byte */
-	if (!(buf[0] & 0x01))
+	if (!(buf[0] & 0x01)) {
 		dev_dbg(d->dev, "%s: damon st1(0x%02X) is not DRDY\n", __func__, buf[0]);
+		return -1;
+	}
 
 	if (d->ten_bit) {
-		/* [RE] 10-bit mode: low byte plus two bits from the status byte */
-		ret = m1120_read_block(d, M1120_REG_ID, 1, &extra);
-		if (ret)
-			return ret;
-		v = buf[1] | (((extra >> 6) & 0x3) << 8);
-		v = (v & 0x200) ? (v | ~0x3ff) : v;	/* sign extend bit 9 */
+		v = buf[1] | (((buf[2] >> 6) & 0x1) << 8);
+		if (buf[2] & 0x80)
+			v |= ~0x3ff;			/* sign extend bit 9 */
 	} else {
-		/* [RE] 8-bit mode */
-		v = buf[2] & 0x7f;
-		v = (buf[2] & 0x80) ? (v | ~0x7f) : v;	/* sign extend bit 7 */
+		v = buf[1] & 0x7f;
+		if (buf[1] & 0x80)
+			v |= ~0x7f;			/* sign extend bit 7 */
 	}
 
 	*value = (s16)v;
-	dev_dbg(d->dev, "%s: raw = %d\n", __func__, *value);
+	dev_dbg(d->dev, "%s: raw = %d (st 0x%02x lo 0x%02x hi 0x%02x)\n",
+		__func__, *value, buf[0], buf[1], buf[2]);
 	return 0;
 }
 
@@ -405,18 +414,56 @@ static ssize_t delay_store(struct device *dev, struct device_attribute *attr,
 	return count;
 }
 
+/* [RE] the vendor's dump attribute: registers 0x00 to 0x13, byte by byte */
+static ssize_t dump_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct m1120_data *d = dev_get_drvdata(dev);
+	u8 regs[M1120_DUMP_LEN];
+	u8 blk[M1120_DATA_LEN];
+	int i, n = 0, ret;
+
+	mutex_lock(&d->lock);
+	for (i = 0; i < M1120_DUMP_LEN; i++) {
+		ret = m1120_read_block(d, (u8)i, 1, &regs[i]);
+		if (ret) {
+			mutex_unlock(&d->lock);
+			return scnprintf(buf, PAGE_SIZE,
+					 "read reg 0x%02x failed (%d)\n", i, ret);
+		}
+	}
+	mutex_unlock(&d->lock);
+
+	for (i = 0; i < M1120_DUMP_LEN; i++)
+		n += scnprintf(buf + n, PAGE_SIZE - n, "[%02x]=%02x ", i, regs[i]);
+	n += scnprintf(buf + n, PAGE_SIZE - n, "\n");
+
+	/* the block the measurement actually uses */
+	mutex_lock(&d->lock);
+	ret = m1120_read_block(d, M1120_REG_DATA, M1120_DATA_LEN, blk);
+	mutex_unlock(&d->lock);
+	if (!ret)
+		n += scnprintf(buf + n, PAGE_SIZE - n,
+			       "0x10 block: st=0x%02x lo=0x%02x hi=0x%02x ",
+			       blk[0], blk[1], blk[2]);
+	n += scnprintf(buf + n, PAGE_SIZE - n, "ten_bit=%d enabled=%d id=0x%02x\n",
+		       d->ten_bit, d->enabled, d->device_id);
+	return n;
+}
+
 static ssize_t vendor_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	return scnprintf(buf, PAGE_SIZE, "magnachip\n");
 }
 
 static DEVICE_ATTR_RO(data);
+static DEVICE_ATTR_RO(dump);
 static DEVICE_ATTR_RW(enable);
 static DEVICE_ATTR_RW(delay);
 static DEVICE_ATTR_RO(vendor);
 
 static struct attribute *m1120_attrs[] = {
 	&dev_attr_data.attr,
+	&dev_attr_dump.attr,
 	&dev_attr_enable.attr,
 	&dev_attr_delay.attr,
 	&dev_attr_vendor.attr,
