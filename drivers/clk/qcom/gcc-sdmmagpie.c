@@ -330,7 +330,40 @@ static struct clk_rcg2 gcc_cpuss_rbcpr_clk_src = {
 	},
 };
 
+/*
+ * [RE] Restored from the factory kernel: this table also carries the low
+ * frequencies the EEBBK S6 camera elevator chopper runs at.  They all come from
+ * bi_tcxo through the half integer divider h and the mnd ratio m/n, so with
+ * clk_rcg2_calc_rate() = (parent / h) * m / n:
+ *
+ *     19200000 / 16 * 2 / 75  = 32000   a normal move
+ *     19200000 / 16 * 4 / 250 = 19200   first stage of a long move
+ *     19200000 / 15 * 8 / 246 = 41626   second stage of a long move
+ *
+ * which is exactly what drivers/misc/gpio_pwm.c asks for.  Without them the RCG
+ * can only produce 19.2 MHz and up, clk_set_rate() on the gcc_gp2_clk branch
+ * silently leaves the pin at 19.2 MHz, and the motor driver - which cannot
+ * switch that fast - only hums: the elevator never moved, in this kernel or in
+ * the vendor's own driver, which asks for the same three rates.
+ */
 static const struct freq_tbl ftbl_gcc_gp1_clk_src[] = {
+	F(4800, P_BI_TCXO, 16, 1, 250),
+	F(8000, P_BI_TCXO, 16, 1, 150),
+	F(9600, P_BI_TCXO, 16, 2, 250),
+	F(10000, P_BI_TCXO, 16, 1, 120),
+	F(10406, P_BI_TCXO, 15, 2, 246),
+	F(12800, P_BI_TCXO, 10, 1, 150),
+	F(16000, P_BI_TCXO, 16, 1, 75),
+	F(19200, P_BI_TCXO, 16, 4, 250),
+	F(20800, P_BI_TCXO, 15, 4, 246),
+	F(25600, P_BI_TCXO, 10, 2, 150),
+	F(28800, P_BI_TCXO, 16, 3, 125),
+	F(32000, P_BI_TCXO, 16, 2, 75),
+	F(38400, P_BI_TCXO, 8, 2, 125),
+	F(40000, P_BI_TCXO, 16, 4, 120),
+	F(41600, P_BI_TCXO, 15, 8, 246),
+	F(48000, P_BI_TCXO, 16, 3, 75),
+	F(64000, P_BI_TCXO, 16, 4, 75),
 	F(19200000, P_BI_TCXO, 1, 0, 0),
 	F(25000000, P_GPLL0_OUT_EVEN, 12, 0, 0),
 	F(50000000, P_GPLL0_OUT_EVEN, 6, 0, 0),
