@@ -87,6 +87,7 @@
 #include <linux/of_gpio.h>
 #include <linux/gpio.h>
 #include <linux/clk.h>
+#include <linux/clk-provider.h>
 #include <linux/pinctrl/consumer.h>
 #include <linux/hrtimer.h>
 #include <linux/ktime.h>
@@ -257,6 +258,14 @@ struct vib_pwm {
 	char			notify_str[32];
 	/* key injection */
 	struct input_dev	*input;
+	/*
+	 * The clock has to be tracked by hand: the timer callback stops the
+	 * waveform and the deferred work then finishes the move, so without
+	 * these flags clk_disable() runs twice and the clock core warns about
+	 * an unbalanced disable (drivers/clk/clk.c:903).
+	 */
+	bool			clk_on;
+	bool			clk_prepared;
 };
 
 static struct vib_pwm *vib_pwm_dev;
@@ -352,6 +361,33 @@ static ktime_t vib_pwm_move_time(struct vib_pwm *d)
 }
 
 /*
+ * The chopper frequency lives in the RCG behind the branch clock this driver
+ * was given, so setting it on the branch alone does nothing: measured on the
+ * device, the pin kept outputting 19.2 MHz whatever freq was written.  The
+ * vendor has the same latent bug, which is why the stock kernel never moved the
+ * elevator.  Program the parent and report what the framework ends up with.
+ */
+static void vib_pwm_set_clock(struct vib_pwm *d)
+{
+	struct clk *src = clk_get_parent(d->gp2_clk);
+	int ret;
+
+	ret = clk_set_rate(d->gp2_clk, d->freq);
+	if (ret)
+		dev_err(d->dev, "%s: can't set pwm_clk rate ret=%d\n", __func__, ret);
+
+	if (src && !IS_ERR(src)) {
+		ret = clk_set_rate(src, d->freq);
+		if (ret)
+			dev_err(d->dev, "%s: can't set %s rate ret=%d\n", __func__,
+				__clk_get_name(src), ret);
+		dev_info(d->dev, "%s: freq %lu, %s -> %lu Hz, branch %lu Hz\n",
+			 __func__, d->freq, __clk_get_name(src),
+			 clk_get_rate(src), clk_get_rate(d->gp2_clk));
+	}
+}
+
+/*
  * [RE] vib_pwm_set_camera_state: program the clock, bring the driver up in the
  * order the vendor used and arm the move timer.  enable is 1 for up and 2 for
  * down; any other value only brakes.
@@ -392,18 +428,11 @@ static int vib_pwm_set_camera_state(struct vib_pwm *d)
 
 	when = vib_pwm_move_time(d);
 
-	ret = clk_set_rate(d->gp2_clk, d->freq);
-	if (ret < 0) {
-		dev_err(d->dev, "%s: can't set pwm_clk rate ret=%d\n", __func__, ret);
-		if (d->ws_active) {
-			__pm_relax(&d->wakeup);
-			d->ws_active = false;
-		}
-		return ret;
-	}
 
 	bbk_hall_core_enable(0);
 	clk_prepare(d->gp2_clk);
+	d->clk_prepared = true;
+	vib_pwm_set_clock(d);
 
 	/* direction first: zero raises the elevator, one lowers it */
 	vib_pwm_gpio_set(d->dir_gpio, d->enable == 1 ? 0 : 1);
@@ -414,6 +443,7 @@ static int vib_pwm_set_camera_state(struct vib_pwm *d)
 	msleep(3);
 
 	clk_enable(d->gp2_clk);
+	d->clk_on = true;
 
 	d->move_count++;
 	hrtimer_start(&d->timer, when, HRTIMER_MODE_REL_PINNED);
@@ -430,12 +460,7 @@ static void vib_pwm_stage2(struct vib_pwm *d)
 	int ret;
 
 	d->freq = VIB_PWM_FREQ_STAGE2;
-	ret = clk_set_rate(d->gp2_clk, d->freq);
-	if (ret < 0) {
-		dev_err(d->dev, "%s: can't set pwm_clk rate ret=%d\n", __func__, ret);
-		d->time_ms = 0;
-		return;
-	}
+	vib_pwm_set_clock(d);
 	ms = (d->time_ms - d->pre_time) * VIB_PWM_STAGE2_NUM / VIB_PWM_STAGE2_DEN;
 	d->time_ms = ms;
 	dev_info(d->dev,
@@ -454,7 +479,10 @@ static void vib_pwm_stage2(struct vib_pwm *d)
 static void vib_pwm_stop_waveform(struct vib_pwm *d)
 {
 	d->is_move = false;
-	clk_disable(d->gp2_clk);
+	if (d->clk_on) {
+		clk_disable(d->gp2_clk);
+		d->clk_on = false;
+	}
 	vib_pwm_gpio_set(d->boost_gpio, 0);
 	vib_pwm_gpio_set(d->enable_gpio, 1);
 	vib_pwm_gpio_set(d->sleep_gpio, 0);
@@ -464,8 +492,14 @@ static void vib_pwm_stop_waveform(struct vib_pwm *d)
 static void vib_pwm_motor_down(struct vib_pwm *d)
 {
 	d->is_move = false;
-	clk_disable(d->gp2_clk);
-	clk_unprepare(d->gp2_clk);
+	if (d->clk_on) {
+		clk_disable(d->gp2_clk);
+		d->clk_on = false;
+	}
+	if (d->clk_prepared) {
+		clk_unprepare(d->gp2_clk);
+		d->clk_prepared = false;
+	}
 	vib_pwm_brake(d);
 }
 
@@ -1156,6 +1190,60 @@ static DEVICE_ATTR_RW(vib_pwm_cali);
 static DEVICE_ATTR_RW(vib_pwm_up_down_count);
 static DEVICE_ATTR_RW(vib_pwm_clear_cali_data);
 
+#ifdef CONFIG_BBK_DEBUG_BRINGUP
+/*
+ * Bring-up only.  The one thing that cannot be seen from userspace is the rate
+ * the clock framework ends up programming for the chopper: the vendor sets
+ * 32000 for a normal move, and because the travel is a pulse count a wrong rate
+ * moves the elevator a wrong distance.
+ */
+static ssize_t vib_pwm_debug_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	struct vib_pwm *d = dev_get_drvdata(dev);
+	struct clk *p = clk_get_parent(d->gp2_clk);
+	int n;
+
+	n = sprintf(buf,
+		    "freq=%d time_ms=%u enable=%d state=%d target=%d clk_on=%d clk_prepared=%d\n",
+		    (int)d->freq, d->time_ms, d->enable, d->camera_state,
+		    d->target_state, d->clk_on, d->clk_prepared);
+	n += sprintf(buf + n,
+		     "gp2_clk rate=%lu round(%d)=%ld enabled=%d parent=%s parent_rate=%lu\n",
+		     clk_get_rate(d->gp2_clk), (int)d->freq,
+		     clk_round_rate(d->gp2_clk, d->freq),
+		     __clk_is_enabled(d->gp2_clk),
+		     (p && !IS_ERR(p)) ? __clk_get_name(p) : "?",
+		     (p && !IS_ERR(p)) ? clk_get_rate(p) : 0);
+	n += sprintf(buf + n, "boost=%d en=%d sleep=%d dir=%d id=%d\n",
+		     gpiod_get_raw_value(gpio_to_desc(d->boost_gpio)),
+		     gpiod_get_raw_value(gpio_to_desc(d->enable_gpio)),
+		     gpiod_get_raw_value(gpio_to_desc(d->sleep_gpio)),
+		     gpiod_get_raw_value(gpio_to_desc(d->dir_gpio)),
+		     gpiod_get_raw_value(gpio_to_desc(d->id_gpio)));
+	return n;
+}
+
+static ssize_t vib_pwm_debug_store(struct device *dev,
+				   struct device_attribute *attr,
+				   const char *buf, size_t count)
+{
+	struct vib_pwm *d = dev_get_drvdata(dev);
+	unsigned int ms;
+	int v;
+
+	if (sscanf(buf, "time %u", &ms) == 1)
+		d->time_ms = ms;
+	else if (sscanf(buf, "freq %d", &v) == 1)
+		d->freq = v;
+	else if (sscanf(buf, "round %d", &v) == 1)
+		dev_info(d->dev, "%s: round_rate(%d) = %ld\n", __func__, v,
+			 clk_round_rate(d->gp2_clk, v));
+	return count;
+}
+static DEVICE_ATTR_RW(vib_pwm_debug);
+#endif
+
 static struct attribute *vib_pwm_attrs[] = {
 	&dev_attr_vib_pwm_id.attr,
 	&dev_attr_vib_pwm_freq.attr,
@@ -1172,6 +1260,9 @@ static struct attribute *vib_pwm_attrs[] = {
 	&dev_attr_vib_pwm_cali.attr,
 	&dev_attr_vib_pwm_up_down_count.attr,
 	&dev_attr_vib_pwm_clear_cali_data.attr,
+#ifdef CONFIG_BBK_DEBUG_BRINGUP
+	&dev_attr_vib_pwm_debug.attr,
+#endif
 	NULL,
 };
 ATTRIBUTE_GROUPS(vib_pwm);
