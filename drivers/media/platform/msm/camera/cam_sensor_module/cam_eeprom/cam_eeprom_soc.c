@@ -119,6 +119,38 @@ int cam_eeprom_spi_parse_of(struct cam_sensor_spi_client *spi_dev)
  * the @of node, calculate total data length, and allocates required buffer.
  * It only fills the map, but does not perform actual reading.
  */
+/*
+ * EEBBK S6 (P20H130): the factory device tree names every memory map property
+ * with the qcom, prefix - qcom,num-blocks, qcom,page0, qcom,poll0, qcom,mem0
+ * and so on - while this driver looks them up unprefixed.  The whole map then
+ * failed to parse ("num-blocks not available rc -22"), so no eeprom subdevice
+ * was created for either camera and the front camera never reached the camera
+ * provider.  Try the prefixed name first and fall back to the bare one, which
+ * keeps an upstream device tree working too.
+ */
+static int cam_eeprom_read_u32_prop(struct device_node *node, const char *name,
+				    uint32_t *value)
+{
+	char property[PROPERTY_MAXSIZE];
+
+	snprintf(property, PROPERTY_MAXSIZE, "qcom,%s", name);
+	if (!of_property_read_u32(node, property, value))
+		return 0;
+	return of_property_read_u32(node, name, value);
+}
+
+static int cam_eeprom_read_u32_array_prop(struct device_node *node,
+					  const char *name, uint32_t *value,
+					  uint32_t count)
+{
+	char property[PROPERTY_MAXSIZE];
+
+	snprintf(property, PROPERTY_MAXSIZE, "qcom,%s", name);
+	if (!of_property_read_u32_array(node, property, value, count))
+		return 0;
+	return of_property_read_u32_array(node, name, value, count);
+}
+
 int cam_eeprom_parse_dt_memory_map(struct device_node *node,
 	struct cam_eeprom_memory_block_t *data)
 {
@@ -128,7 +160,7 @@ int cam_eeprom_parse_dt_memory_map(struct device_node *node,
 	struct    cam_eeprom_memory_map_t *map;
 
 	snprintf(property, PROPERTY_MAXSIZE, "num-blocks");
-	rc = of_property_read_u32(node, property, &data->num_map);
+	rc = cam_eeprom_read_u32_prop(node, property, &data->num_map);
 	if (rc < 0) {
 		CAM_ERR(CAM_EEPROM, "failed: num-blocks not available rc %d",
 			rc);
@@ -144,7 +176,7 @@ int cam_eeprom_parse_dt_memory_map(struct device_node *node,
 
 	for (i = 0; i < data->num_map; i++) {
 		snprintf(property, PROPERTY_MAXSIZE, "page%d", i);
-		rc = of_property_read_u32_array(node, property,
+		rc = cam_eeprom_read_u32_array_prop(node, property,
 			(uint32_t *) &map[i].page, count);
 		if (rc < 0) {
 			CAM_ERR(CAM_EEPROM, "failed: page not available rc %d",
@@ -153,19 +185,19 @@ int cam_eeprom_parse_dt_memory_map(struct device_node *node,
 		}
 
 		snprintf(property, PROPERTY_MAXSIZE, "pageen%d", i);
-		rc = of_property_read_u32_array(node, property,
+		rc = cam_eeprom_read_u32_array_prop(node, property,
 			(uint32_t *) &map[i].pageen, count);
 		if (rc < 0)
 			CAM_DBG(CAM_EEPROM, "pageen not needed");
 
 		snprintf(property, PROPERTY_MAXSIZE, "saddr%d", i);
-		rc = of_property_read_u32_array(node, property,
+		rc = cam_eeprom_read_u32_array_prop(node, property,
 			(uint32_t *) &map[i].saddr, 1);
 		if (rc < 0)
 			CAM_DBG(CAM_EEPROM, "saddr not needed - block %d", i);
 
 		snprintf(property, PROPERTY_MAXSIZE, "poll%d", i);
-		rc = of_property_read_u32_array(node, property,
+		rc = cam_eeprom_read_u32_array_prop(node, property,
 			(uint32_t *) &map[i].poll, count);
 		if (rc < 0) {
 			CAM_ERR(CAM_EEPROM, "failed: poll not available rc %d",
@@ -174,7 +206,7 @@ int cam_eeprom_parse_dt_memory_map(struct device_node *node,
 		}
 
 		snprintf(property, PROPERTY_MAXSIZE, "mem%d", i);
-		rc = of_property_read_u32_array(node, property,
+		rc = cam_eeprom_read_u32_array_prop(node, property,
 			(uint32_t *) &map[i].mem, count);
 		if (rc < 0) {
 			CAM_ERR(CAM_EEPROM, "failed: mem not available rc %d",
