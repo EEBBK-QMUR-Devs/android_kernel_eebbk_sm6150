@@ -144,11 +144,29 @@ static int cam_eeprom_read_u32_array_prop(struct device_node *node,
 					  uint32_t count)
 {
 	char property[PROPERTY_MAXSIZE];
+	int  n;
 
 	snprintf(property, PROPERTY_MAXSIZE, "qcom,%s", name);
-	if (!of_property_read_u32_array(node, property, value, count))
-		return 0;
-	return of_property_read_u32_array(node, name, value, count);
+	n = of_property_count_elems_of_size(node, property, sizeof(uint32_t));
+	if (n <= 0) {
+		snprintf(property, PROPERTY_MAXSIZE, "%s", name);
+		n = of_property_count_elems_of_size(node, property,
+						    sizeof(uint32_t));
+	}
+	if (n <= 0)
+		return -EINVAL;
+	if (n > (int)count)
+		n = count;
+
+	/*
+	 * EEBBK S6 (P20H130): the factory device tree gives six values per
+	 * memory map property while MSM_EEPROM_MEM_MAP_PROPERTIES_CNT is eight,
+	 * so asking for eight failed with -EINVAL ("failed: page not available
+	 * rc -22") and the map was torn down.  Read what the tree actually
+	 * provides; the remaining fields stay zero, which is what vzalloc()
+	 * already produces and what the unused entries should be.
+	 */
+	return of_property_read_u32_array(node, property, value, n);
 }
 
 int cam_eeprom_parse_dt_memory_map(struct device_node *node,
