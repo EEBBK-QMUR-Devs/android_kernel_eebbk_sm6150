@@ -1274,6 +1274,61 @@ static struct platform_driver vib_pwm_driver = {
 		.pm		= &vib_pwm_pm_ops,
 	},
 };
+
+/* ------------------------------------------------- mhall calibration ----- */
+
+/*
+ * [RE] the 48 byte blob the framework persists as cali_mhall_final.  Its layout
+ * is fixed by the file userspace writes, so it is repeated here rather than
+ * shared through a header:
+ *   +0x00 s16 hall_up   +0x02 s16 hall_down   +0x04 int valid (must be 1)
+ *   +0x08 s16 hall_up_1 +0x10 s16 hall_up_2   +0x18 s16 hall_up_3
+ *   +0x20 s16 hall_up_4 +0x28 int f2          +0x2c int add_time
+ */
+struct mhall_cali_blob {
+	s16	hall_up;
+	s16	hall_down;
+	int	valid;
+	s16	hall_up_1;
+	u8	pad0[6];
+	s16	hall_up_2;
+	u8	pad1[6];
+	s16	hall_up_3;
+	u8	pad2[6];
+	s16	hall_up_4;
+	u8	pad3[6];
+	int	f2;
+	int	add_time;
+};
+
+/*
+ * [RE] init_hall_data_fake: the hall framework calls this after it accepted a
+ * calibration blob, and the value comes back as one of our module parameters so
+ * that it survives in /sys/module/gpio_pwm/parameters/.  The vendor returns 1 on
+ * success and -1 when the blob is not marked valid.
+ */
+int init_hall_data_fake(const void *p)
+{
+	const struct mhall_cali_blob *b = p;
+
+	if (!b || b->valid != 1) {
+		pr_err("zyhc set mhall cali data failed\n");
+		return -1;
+	}
+
+	mhall_control_up = b->hall_up;
+	mhall_control_down = b->hall_down;
+	mhall_control3 = b->hall_up_1;
+	mhall_control2 = b->f2;
+	mhall_control6 = b->add_time;
+
+	pr_info("zyhc data_up:%d,data_down:%d,fake_data2:%d,fake_data3:%d,add_time:%d\n",
+		mhall_control_up, mhall_control_down, mhall_control2,
+		mhall_control3, mhall_control6);
+	return 1;
+}
+EXPORT_SYMBOL_GPL(init_hall_data_fake);
+
 module_platform_driver(vib_pwm_driver);
 
 MODULE_AUTHOR("EEBBK S6 kernel reconstruction");
