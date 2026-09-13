@@ -168,6 +168,21 @@ static int m1120_init_device(struct m1120_data *d)
 	int ret;
 
 	/* [RE] the exact sequence the vendor probe used */
+#ifdef CONFIG_BBK_DEBUG_BRINGUP
+	/* bring-up: a single unreadable register must not stop the probe */
+	ret = m1120_i2c_set_reg(d, M1120_REG_CTRL2, 0x01);
+	if (ret)
+		dev_err(d->dev, "%s: write 0x07 failed (%d), continuing anyway\n",
+			__func__, ret);
+
+	ret = m1120_get_id(d, &d->device_id);
+	if (ret)
+		dev_err(d->dev, "%s: read id failed (%d), continuing anyway\n",
+			__func__, ret);
+	else if (d->device_id != M1120_ID_EXPECT)
+		dev_err(d->dev, "%s: current device id(0x%02X) is not M1120 device id(0x%02X)\n",
+			__func__, d->device_id, M1120_ID_EXPECT);
+#else
 	ret = m1120_i2c_set_reg(d, M1120_REG_CTRL2, 0x01);
 	if (ret)
 		return ret;
@@ -180,6 +195,7 @@ static int m1120_init_device(struct m1120_data *d)
 			__func__, d->device_id, M1120_ID_EXPECT);
 		return -ENODEV;
 	}
+#endif
 
 	ret = m1120_i2c_set_reg(d, M1120_REG_ID, 0x40);
 	if (ret)
@@ -535,8 +551,15 @@ static int m1120_i2c_drv_probe(struct i2c_client *client,
 
 	if (!i2c_check_functionality(client->adapter,
 				     I2C_FUNC_SMBUS_I2C_BLOCK | I2C_FUNC_I2C)) {
+#ifdef CONFIG_BBK_DEBUG_BRINGUP
+		/* bring-up: warn instead of refusing to probe */
+		dev_err(d->dev,
+			"%s: adapter does not advertise SMBUS_I2C_BLOCK, continuing anyway\n",
+			__func__);
+#else
 		dev_err(d->dev, "%s: i2c_check_functionality was failed\n", __func__);
 		return -EOPNOTSUPP;
+#endif
 	}
 
 	/* optional supplies: the vendor probe requested two regulators */

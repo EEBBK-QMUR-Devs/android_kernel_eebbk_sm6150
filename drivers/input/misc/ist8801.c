@@ -345,6 +345,18 @@ static int ist8801_i2c_probe(struct i2c_client *client,
 
 	ist8801_parse_dt(d);
 
+#ifdef CONFIG_BBK_DEBUG_BRINGUP
+	/* bring-up: a single unreadable register must not stop the probe */
+	ret = ist8801_reset_device(d);
+	if (ret)
+		dev_err(d->dev, "%s : ist8801_reset_device fail(%d), continuing anyway\n",
+			__func__, ret);
+
+	ret = ist8801_get_id(d, &did);
+	if (ret)
+		dev_err(d->dev, "%s : read IST8801_REG_DID failed(%d), continuing anyway\n",
+			__func__, ret);
+#else
 	ret = ist8801_reset_device(d);
 	if (ret) {
 		dev_err(d->dev, "%s : ist8801_reset_device fail\n", __func__);
@@ -357,6 +369,7 @@ static int ist8801_i2c_probe(struct i2c_client *client,
 			__func__, ret);
 		return ret;
 	}
+#endif
 	d->did = did;
 
 	dev_info(d->dev, "%s: ist8801 at 0x%02x, device id 0x%02x\n",

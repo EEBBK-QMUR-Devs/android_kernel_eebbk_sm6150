@@ -159,6 +159,20 @@ static ssize_t sel_write_enforce(struct file *file, const char __user *buf,
 
 	new_value = !!new_value;
 
+#ifdef CONFIG_BBK_DEBUG_BRINGUP
+	/*
+	 * EEBBK bring-up: Android init writes 1 here early in userspace, which
+	 * overrode the permissive start in selinux_init().  Ignore the request
+	 * so the kernel stays permissive and adb shell can read the vendor sysfs
+	 * nodes and /proc/eebbk_kmsg.
+	 */
+	pr_info("SELinux:  EEBBK bring-up build ignores enforce write (%d)\n",
+		new_value);
+	length = count;
+	kfree(page);
+	return length;
+#endif
+
 	old_value = enforcing_enabled(state);
 	if (new_value != old_value) {
 		length = avc_has_perm(&selinux_state,
