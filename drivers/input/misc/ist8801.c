@@ -346,7 +346,7 @@ static int ist8801_i2c_probe(struct i2c_client *client,
 	ist8801_parse_dt(d);
 
 #ifdef CONFIG_BBK_DEBUG_BRINGUP
-	/* bring-up: a single unreadable register must not stop the probe */
+	/* bring-up: the part on this board does not answer, see the notes */
 	ret = ist8801_reset_device(d);
 	if (ret)
 		dev_err(d->dev, "%s : ist8801_reset_device fail(%d), continuing anyway\n",
