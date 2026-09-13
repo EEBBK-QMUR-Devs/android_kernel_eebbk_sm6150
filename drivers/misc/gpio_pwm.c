@@ -223,6 +223,14 @@ struct vib_pwm {
 	bool			ws_active;
 	wait_queue_head_t	wait;
 	struct hrtimer		timer;
+	/*
+	 * [RE] the vendor's hrtimer handler only stops the electrical part and
+	 * queues its work one jiffy later; the work does everything that may
+	 * sleep.  Splitting it is not cosmetic: sleeping inside the hrtimer
+	 * callback corrupts the kernel ("bad: scheduling from the idle thread!"
+	 * with msleep <- vib_pwm_brake <- vib_pwm_timer_func in the trace).
+	 */
+	struct work_struct	finish_work;
 	/* move state */
 	unsigned int		time_ms;
 	unsigned int		pre_time;
@@ -344,6 +352,9 @@ static int vib_pwm_set_camera_state(struct vib_pwm *d)
 		return 0;
 	}
 
+	/* drop a finish that is still pending: it belongs to the previous move */
+	cancel_work_sync(&d->finish_work);
+
 	if (!d->ws_active) {
 		__pm_stay_awake(&d->wakeup);
 		d->ws_active = true;
@@ -404,6 +415,21 @@ static void vib_pwm_stage2(struct vib_pwm *d)
 	hrtimer_start(&d->timer, vib_pwm_ms_to_ktime(ms), HRTIMER_MODE_REL_PINNED);
 }
 
+/*
+ * [RE] stop the waveform and the driver from interrupt context: three gpio
+ * writes and clk_disable, exactly the steps the vendor's hrtimer handler does.
+ * The vendor's 5 ms brake delay, clk_unprepare, the hall framework calls and the
+ * second stage all belong to the deferred work, because they may sleep.
+ */
+static void vib_pwm_stop_waveform(struct vib_pwm *d)
+{
+	d->is_move = false;
+	clk_disable(d->gp2_clk);
+	vib_pwm_gpio_set(d->boost_gpio, 0);
+	vib_pwm_gpio_set(d->enable_gpio, 1);
+	vib_pwm_gpio_set(d->sleep_gpio, 0);
+}
+
 /* stop the electrical part of a move; must not cancel the timer */
 static void vib_pwm_motor_down(struct vib_pwm *d)
 {
@@ -447,23 +473,42 @@ static void vib_pwm_finish_move(struct vib_pwm *d, bool keep_state)
 		 __func__, d->camera_state);
 }
 
+/*
+ * [RE] the vendor's handler: stop what can be stopped without sleeping and hand
+ * the rest to the work.  Nothing here may sleep - no msleep, no clk_unprepare,
+ * no clk_set_rate, no cancel of another work.
+ */
 static enum hrtimer_restart vib_pwm_timer_func(struct hrtimer *timer)
 {
 	struct vib_pwm *d = container_of(timer, struct vib_pwm, timer);
 
 	if (d->is_subsection) {
-		/* the preliminary 50 ms stage, then the fast second stage */
+		/* the preliminary stage is over: the second stage's clk_set_rate
+		 * may sleep, so it runs in the work */
 		dev_info(d->dev,
 			 "++++++++++++ %s: is_subsection = true & wait_up_interrupt to start next vib_freq\n",
 			 __func__);
-		vib_pwm_stage2(d);
+		schedule_work(&d->finish_work);
 		return HRTIMER_NORESTART;
 	}
 
-	d->is_move = false;
+	vib_pwm_stop_waveform(d);
+	schedule_work(&d->finish_work);
+	return HRTIMER_NORESTART;
+}
+
+/* the deferred half: everything that may sleep */
+static void vib_pwm_finish_work(struct work_struct *work)
+{
+	struct vib_pwm *d = container_of(work, struct vib_pwm, finish_work);
+
+	if (d->is_subsection) {
+		vib_pwm_stage2(d);
+		return;
+	}
+
 	vib_pwm_finish_move(d, false);
 	wake_up_interruptible(&d->wait);
-	return HRTIMER_NORESTART;
 }
 
 /* ------------------------------------------------------ state machine ---- */
@@ -597,6 +642,7 @@ void cancel_vib_hrtimer(int arg)
 	if (!d)
 		return;
 	hrtimer_cancel(&d->timer);
+	cancel_work_sync(&d->finish_work);
 	bbk_hall_core_init_queue();
 	bbk_hall_core_init_move_queue();
 	vib_pwm_finish_move(d, true);
@@ -713,8 +759,10 @@ static ssize_t vib_pwm_enable_store(struct device *dev, struct device_attribute 
 
 	mutex_lock(&d->lock);
 	d->enable = (v == 1 || v == 2) ? v : 0;
-	if (d->enable == 0)
+	if (d->enable == 0) {
 		hrtimer_cancel(&d->timer);
+		cancel_work_sync(&d->finish_work);
+	}
 	vib_pwm_set_camera_state(d);
 	mutex_unlock(&d->lock);
 	return count;
@@ -1200,6 +1248,7 @@ static int vib_pwm_probe(struct platform_device *pdev)
 	wakeup_source_init(&d->wakeup, "vib_wake_lock");
 	hrtimer_init(&d->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED);
 	d->timer.function = vib_pwm_timer_func;
+	INIT_WORK(&d->finish_work, vib_pwm_finish_work);
 
 	ret = vib_pwm_input_init(d);
 	if (ret)
@@ -1237,6 +1286,7 @@ static int vib_pwm_remove(struct platform_device *pdev)
 
 	if (d) {
 		hrtimer_cancel(&d->timer);
+		cancel_work_sync(&d->finish_work);
 		vib_pwm_brake(d);
 		wakeup_source_destroy(&d->wakeup);
 		sysfs_remove_groups(&pdev->dev.kobj, vib_pwm_groups);

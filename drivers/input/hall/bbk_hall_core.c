@@ -581,8 +581,16 @@ static void bbk_hal_work_func(struct work_struct *work)
 	}
 
 resched:
-	queue_delayed_work_on(8 /* WORK_CPU_UNBOUND */, system_wq, &d->work,
-			      msecs_to_jiffies(d->delay));
+	/*
+	 * Only re-arm while the framework is still enabled.  The disable path
+	 * clears the flag before it cancels, so a self requeue here would make
+	 * cancel_delayed_work_sync() wait for a work that keeps re-scheduling
+	 * itself - a livelock that hangs whoever called enable(0), which is the
+	 * elevator driver on every move.
+	 */
+	if (atomic_read(&d->enabled))
+		queue_delayed_work_on(8 /* WORK_CPU_UNBOUND */, system_wq,
+				      &d->work, msecs_to_jiffies(d->delay));
 }
 
 /* [RE] enable is idempotent through an atomic compare and swap */
