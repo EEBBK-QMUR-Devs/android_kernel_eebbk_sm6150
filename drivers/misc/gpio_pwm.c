@@ -295,6 +295,33 @@ static void vib_pwm_gpio_input(int gpio)
 		gpiod_direction_input(gpio_to_desc(gpio));
 }
 
+/*
+ * [RE] the device tree carries three pinctrl states for this driver:
+ * "vib_pwm_active" muxes gpio21 to the gcc_gp2 clock output, "vib_pwm_suspend"
+ * turns it back into a pulled down gpio and "vib_pwm_idconfig" configures the id
+ * strap on gpio25.  pinctrl_select_state() *replaces* the selected state, so
+ * leaving idconfig selected after the probe also dropped the clock mux and the
+ * motor received no waveform at all: the driver ran its whole move sequence
+ * while the elevator never moved.  Select active for a move and suspend after
+ * it, which is what these two states exist for.
+ */
+static void vib_pwm_select_pins(struct vib_pwm *d, bool active)
+{
+	struct pinctrl_state *state;
+
+	if (IS_ERR_OR_NULL(d->pinctrl))
+		return;
+	state = active ? d->pins_active : d->pins_suspend;
+	if (IS_ERR_OR_NULL(state))
+		return;
+	if (pinctrl_select_state(d->pinctrl, state))
+		dev_err(d->dev, "%s: cannot select the %s pinctrl state\n",
+			__func__, active ? "active" : "suspend");
+	else
+		dev_info(d->dev, "%s: pinctrl %s\n", __func__,
+			 active ? "active" : "suspend");
+}
+
 static void vib_pwm_brake(struct vib_pwm *d)
 {
 	/* [RE] boost = 0, msleep(5), enable = 1, sleep = 0; dir is not touched */
@@ -354,6 +381,9 @@ static int vib_pwm_set_camera_state(struct vib_pwm *d)
 
 	/* drop a finish that is still pending: it belongs to the previous move */
 	cancel_work_sync(&d->finish_work);
+
+	/* mux gpio21 back to the gcc_gp2 clock output before driving */
+	vib_pwm_select_pins(d, true);
 
 	if (!d->ws_active) {
 		__pm_stay_awake(&d->wakeup);
@@ -447,6 +477,7 @@ static void vib_pwm_motor_down(struct vib_pwm *d)
 static void vib_pwm_finish_move(struct vib_pwm *d, bool keep_state)
 {
 	vib_pwm_motor_down(d);
+	vib_pwm_select_pins(d, false);
 	d->move_count = 0;
 
 	if (d->target_state <= CAM_STATE_FULL) {
@@ -508,6 +539,7 @@ static void vib_pwm_finish_work(struct work_struct *work)
 	}
 
 	vib_pwm_finish_move(d, false);
+	vib_pwm_select_pins(d, false);
 	wake_up_interruptible(&d->wait);
 }
 
@@ -1239,10 +1271,12 @@ static int vib_pwm_probe(struct platform_device *pdev)
 		d->pins_active = pinctrl_lookup_state(d->pinctrl, "vib_pwm_active");
 		d->pins_suspend = pinctrl_lookup_state(d->pinctrl, "vib_pwm_suspend");
 		d->pins_idconfig = pinctrl_lookup_state(d->pinctrl, "vib_pwm_idconfig");
-		if (!IS_ERR(d->pins_active))
-			pinctrl_select_state(d->pinctrl, d->pins_active);
+		/* read the id strap first, then leave the pins in their idle
+		 * state; a move selects the active state again */
 		if (!IS_ERR(d->pins_idconfig))
 			pinctrl_select_state(d->pinctrl, d->pins_idconfig);
+		if (!IS_ERR(d->pins_suspend))
+			pinctrl_select_state(d->pinctrl, d->pins_suspend);
 	}
 
 	wakeup_source_init(&d->wakeup, "vib_wake_lock");
