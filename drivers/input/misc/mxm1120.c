@@ -233,12 +233,19 @@ static int m1120_set_operation_mode(struct m1120_data *d, bool measure)
 		return ret;
 
 	/*
-	 * [RE] Start and stop the conversion through START (bit 0), the way the
-	 * factory does.  Toggling bit 6 instead - as this driver did - leaves
-	 * the chip in standby: register 0x10 stays zero, the status byte never
-	 * reports DRDY and every sample decodes to nothing.
+	 * [RE] Bit 0 is START and starting the conversion is what the factory
+	 * driver does, but on this ROM the hall samples then reach BBK's camera
+	 * service, which switches the elevator from its open loop timing to a
+	 * closed loop path that this kernel does not implement (the factory's
+	 * vib_pwm_state_move_sate / vib_pwm_state_init pair).  The elevator then
+	 * stops half way - "卡一半不升" - and the front camera is unusable.
+	 *
+	 * Until that path is ported, keep the sensors in standby as before: with
+	 * no valid samples (bbk_hall_data reports the -2000 failure value) the
+	 * service uses the time based move that works, and the camera raises
+	 * normally.  Set M1120_OP_START_SET below to restore the conversion.
 	 */
-	v = measure ? (v | M1120_OP_START_SET) : (v & ~M1120_OP_START);
+	v = measure ? (v | M1120_OP_MEASUREMENT) : (v & ~M1120_OP_MEASUREMENT);
 	ret = m1120_i2c_set_reg(d, M1120_REG_OPMODE, v);
 	dev_info(d->dev, "%s: %s, opmode 0x%02x\n", __func__,
 		 measure ? "start conversion" : "stop conversion", v);
