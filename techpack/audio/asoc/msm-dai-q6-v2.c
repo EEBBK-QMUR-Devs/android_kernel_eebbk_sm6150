@@ -5239,6 +5239,20 @@ static int msm_dai_q6_mi2s_hw_params(struct snd_pcm_substream *substream,
 		dai_data->port_config.i2s.bit_width = 24;
 		dai_data->bitwidth = 24;
 		break;
+	/*
+	 * EEBBK S6 (P20H130): the ROM's audio HAL drives the speaker path -
+	 * Tertiary MI2S into the two AW882xx amplifiers - with 32 bit samples
+	 * (it writes 32 to the BitWidth mixer control and opens the PCM with
+	 * SNDRV_PCM_FORMAT_S32_LE, which is format 10 in the kernel log).
+	 * Without this case every playback of that route fails with
+	 * "can't set Tertiary MI2S hw params: -22" and the speaker stays
+	 * silent.  The vendor's own build of this driver accepts it and
+	 * programs bit_width = 32, which is what the AFE interface allows.
+	 */
+	case SNDRV_PCM_FORMAT_S32_LE:
+		dai_data->port_config.i2s.bit_width = 32;
+		dai_data->bitwidth = 32;
+		break;
 	default:
 		pr_err("%s: format %d\n",
 			__func__, params_format(params));
