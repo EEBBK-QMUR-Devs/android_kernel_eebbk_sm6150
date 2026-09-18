@@ -18638,6 +18638,26 @@ static const int wsa_rx_0_vi_fb_tx_rch_value[] = {
 };
 
 
+/*
+ * EEBBK S6 (P20H130): the ROM drives the speaker, and reads the AW882xx feedback,
+ * on the tertiary MI2S, so the VI feedback mux has to exist for that port too -
+ * the vendor's audio_platform.ko has it and its mixer paths write
+ * "TERT_MI2S_RX_VI_FB_MUX".  This tree only carried the primary MI2S version and
+ * its AW882xx route pointed at QUAT_MI2S_RX_VI_FB_MUX, which is not defined here.
+ */
+static const char * const tert_mi2s_rx_vi_fb_tx_mux_text[] = {
+	"ZERO", "TERT_MI2S_TX"
+};
+
+static const int tert_mi2s_rx_vi_fb_tx_value[] = {
+	MSM_BACKEND_DAI_MAX, MSM_BACKEND_DAI_TERTIARY_MI2S_TX
+};
+
+static const struct soc_enum tert_mi2s_rx_vi_fb_mux_enum =
+	SOC_VALUE_ENUM_DOUBLE(SND_SOC_NOPM, MSM_BACKEND_DAI_TERTIARY_MI2S_RX, 0, 0,
+	ARRAY_SIZE(tert_mi2s_rx_vi_fb_tx_mux_text),
+	tert_mi2s_rx_vi_fb_tx_mux_text, tert_mi2s_rx_vi_fb_tx_value);
+
 static const int mi2s_rx_vi_fb_tx_value[] = {
 #ifdef CONFIG_SND_SOC_TFA9874_FOR_DAVI
 	MSM_BACKEND_DAI_MAX, PLATFORM_RX_VI_FB_TX_VALUE
@@ -18724,6 +18744,11 @@ static const struct snd_kcontrol_new mi2s_rx_vi_fb_mux =
 	SOC_DAPM_ENUM_EXT("PRI_MI2S_RX_VI_FB_MUX",
 #endif
 	mi2s_rx_vi_fb_mux_enum, spkr_prot_get_vi_lch_port,
+	spkr_prot_put_vi_lch_port);
+
+static const struct snd_kcontrol_new tert_mi2s_rx_vi_fb_mux =
+	SOC_DAPM_ENUM_EXT("TERT_MI2S_RX_VI_FB_MUX",
+	tert_mi2s_rx_vi_fb_mux_enum, spkr_prot_get_vi_lch_port,
 	spkr_prot_put_vi_lch_port);
 
 static const struct snd_kcontrol_new int4_mi2s_rx_vi_fb_mono_ch_mux =
@@ -19644,6 +19669,8 @@ static const struct snd_soc_dapm_widget msm_qdsp6_widgets_mi2s[] = {
 	SND_SOC_DAPM_MUX("PRI_MI2S_RX_VI_FB_MUX", SND_SOC_NOPM, 0, 0,
 #endif
 				&mi2s_rx_vi_fb_mux),
+	SND_SOC_DAPM_MUX("TERT_MI2S_RX_VI_FB_MUX", SND_SOC_NOPM, 0, 0,
+				&tert_mi2s_rx_vi_fb_mux),
 	SND_SOC_DAPM_MUX("INT4_MI2S_RX_VI_FB_MONO_CH_MUX", SND_SOC_NOPM, 0, 0,
 				&int4_mi2s_rx_vi_fb_mono_ch_mux),
 	SND_SOC_DAPM_MUX("INT4_MI2S_RX_VI_FB_STEREO_CH_MUX", SND_SOC_NOPM, 0, 0,
@@ -23810,6 +23837,7 @@ static const struct snd_soc_dapm_route intercon_mi2s[] = {
 	{PLATFORM_RX_VI_FB_MUX_NAME, PLATFORM_RX_VI_FB_TX_MUX_TEXT, PLATFORM_RX_VI_FB_TX_MUX_TEXT},
 #elif defined(CONFIG_SND_SOC_AWINIC_AW882XX)
 	{"PRI_MI2S_RX_VI_FB_MUX", "PRI_MI2S_TX", "PRI_MI2S_TX"},
+	{"TERT_MI2S_RX_VI_FB_MUX", "TERT_MI2S_TX", "TERT_MI2S_TX"},
 #else
 	{"PRI_MI2S_RX_VI_FB_MUX", "SENARY_TX", "SENARY_TX"},
 #endif
@@ -23819,6 +23847,7 @@ static const struct snd_soc_dapm_route intercon_mi2s[] = {
 	{PLATFORM_RX_VI_FB_RX_MUX_TEXT, NULL, PLATFORM_RX_VI_FB_MUX_NAME},
 #else
 	{"PRI_MI2S_RX", NULL, "PRI_MI2S_RX_VI_FB_MUX"},
+	{"TERT_MI2S_RX", NULL, "TERT_MI2S_RX_VI_FB_MUX"},
 #endif
 #ifdef CONFIG_SND_SOC_AWINIC_AW882XX
 	{"QUAT_MI2S_RX", NULL, "QUAT_MI2S_RX_VI_FB_MUX"},
