@@ -17,12 +17,14 @@
  *   read : i2c_smbus_read_i2c_block_data(client, reg, len, buf)
  *
  * Register map
- *   0x00  device id / status   read 1 byte, expected 0x9c on a healthy part;
- *                              bits 7:6 are the two high bits of the field in
- *                              10-bit mode
+ *   0x00  command              written 0x40 at probe
  *   0x01  control              written 0x00, then (value & 0x7f)
  *   0x07  control              written 0x01
- *   0x08  operation mode       written 0x40 (measurement), (value & 0xfe)
+ *   0x08  operation mode       written 0x40 at probe; bit 0 is START and is set
+ *                              with bit 3 to convert, cleared to stop
+ *   0x09  chip id              read 1 byte, expected 0x9c
+ *   0x10  sample               3 bytes: status (bit 0 = DRDY, required), low
+ *                              byte, and the high bits plus sign
  *   0x10  3-byte measurement   buf[0] = status (bit 0 = DRDY), buf[1] = low
  *                              bits, buf[2] = high bits
  *   0x00..0x0a                 dumped by the vendor's debug path
@@ -101,6 +103,14 @@ extern void bbk_hall_core_unregister_device(struct hall_dev *dev);
 #define M1120_DATA_LEN		3
 #define M1120_DUMP_LEN		0x14
 #define M1120_OP_MEASUREMENT	0x40
+/*
+ * [RE] Bit 0 of the operation mode register is START: the factory's
+ * m1120_set_operation_mode() writes (mode | 0x09) to begin converting and
+ * (mode & ~0x01) to stop.  Bit 3 is set together with it.  Bit 6 is a mode
+ * selector that is already set by the probe.
+ */
+#define M1120_OP_START		0x01
+#define M1120_OP_START_SET	0x09
 
 enum m1120_pos {
 	M1120_POS_UP = 0,
@@ -221,8 +231,18 @@ static int m1120_set_operation_mode(struct m1120_data *d, bool measure)
 	ret = m1120_read_block(d, M1120_REG_OPMODE, 1, &v);
 	if (ret)
 		return ret;
-	v = measure ? (v | M1120_OP_MEASUREMENT) : (v & ~M1120_OP_MEASUREMENT);
-	return m1120_i2c_set_reg(d, M1120_REG_OPMODE, v);
+
+	/*
+	 * [RE] Start and stop the conversion through START (bit 0), the way the
+	 * factory does.  Toggling bit 6 instead - as this driver did - leaves
+	 * the chip in standby: register 0x10 stays zero, the status byte never
+	 * reports DRDY and every sample decodes to nothing.
+	 */
+	v = measure ? (v | M1120_OP_START_SET) : (v & ~M1120_OP_START);
+	ret = m1120_i2c_set_reg(d, M1120_REG_OPMODE, v);
+	dev_info(d->dev, "%s: %s, opmode 0x%02x\n", __func__,
+		 measure ? "start conversion" : "stop conversion", v);
+	return ret;
 }
 
 /*
