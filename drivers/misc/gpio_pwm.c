@@ -618,12 +618,29 @@ static int vib_pwm_move_to(struct vib_pwm *d, int want)
 {
 	int cur = d->camera_state;
 
-	/* states 4 and 5 are busy, and a calibration blocks a move */
+	/*
+	 * States 4 and 5 are busy, and a calibration blocks a move.  A busy
+	 * state with no timer armed and no move in flight is stale: some path
+	 * cancelled the move without its finish (the enable attribute, or
+	 * cancel_vib_hrtimer() below, which the vendor only repairs through the
+	 * closed loop mover that this kernel does not implement).  Left alone it
+	 * refuses every later request for ever, which is how the elevator ends
+	 * up stuck half way with BBK's camera service waiting for it.  Fall back
+	 * to the position the last finished move reached.
+	 */
 	if ((cur & ~1) == CAM_STATE_BUSY_UP || d->is_in_cali) {
-		dev_info(d->dev,
-			 "%s: want %d, current %d, is_in_cali %d: busy, ignored\n",
-			 __func__, want, cur, d->is_in_cali);
-		return 0;
+		if (!d->is_in_cali && !d->is_move && !hrtimer_active(&d->timer)) {
+			dev_info(d->dev,
+				 "%s: stale busy state %d, treating it as %d\n",
+				 __func__, cur, d->target_state);
+			d->camera_state = d->target_state;
+			cur = d->camera_state;
+		} else {
+			dev_info(d->dev,
+				 "%s: want %d, current %d, is_in_cali %d: busy, ignored\n",
+				 __func__, want, cur, d->is_in_cali);
+			return 0;
+		}
 	}
 
 	if (cur == want)
@@ -713,6 +730,17 @@ void cancel_vib_hrtimer(int arg)
 	if (arg == 0) {
 		d->camera_state = CAM_STATE_ABNORMAL;
 		dev_info(d->dev, "---------only_stop_vib & not do anything, camera_state:6 ----\n");
+	} else if ((d->camera_state & ~1) == CAM_STATE_BUSY_UP) {
+		/*
+		 * The vendor leaves the busy state here because its closed loop
+		 * mover writes the real one immediately afterwards.  Nothing
+		 * does that in this kernel, so repair it now: a camera_state of
+		 * 4 or 5 blocks every later move.
+		 */
+		d->camera_state = d->target_state;
+		dev_info(d->dev,
+			 "%s: repaired camera_state %d after the cancel\n",
+			 __func__, d->camera_state);
 	}
 	wake_up_interruptible(&d->wait);
 }
@@ -826,6 +854,18 @@ static ssize_t vib_pwm_enable_store(struct device *dev, struct device_attribute 
 	if (d->enable == 0) {
 		hrtimer_cancel(&d->timer);
 		cancel_work_sync(&d->finish_work);
+		/*
+		 * Stop the electrical part here and leave a state that later
+		 * moves are not refused from; vib_pwm_set_camera_state() below
+		 * only brakes and never touches camera_state.
+		 */
+		vib_pwm_motor_down(d);
+		if ((d->camera_state & ~1) == CAM_STATE_BUSY_UP) {
+			d->camera_state = d->target_state;
+			dev_info(d->dev,
+				 "%s: repaired camera_state %d after the cancel\n",
+				 __func__, d->camera_state);
+		}
 	}
 	vib_pwm_set_camera_state(d);
 	mutex_unlock(&d->lock);
