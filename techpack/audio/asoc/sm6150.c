@@ -7784,8 +7784,25 @@ static struct snd_soc_dai_link msm_mi2s_be_dai_links[] = {
 		.stream_name = "Tertiary MI2S Playback",
 		.cpu_dai_name = "msm-dai-q6-mi2s.2",
 		.platform_name = "msm-pcm-routing",
+#ifdef CONFIG_SND_SOC_AWINIC_AW882XX
+		/*
+		 * EEBBK S6 (P20H130): the speaker is driven by the two AWINIC
+		 * AW882xx amplifiers on the tertiary MI2S port.  The ROM's
+		 * mixer paths route speaker playback with
+		 * "TERT_MI2S_RX Audio Mixer MultiMedia5" and its HAL registers
+		 * the speaker device on this backend, but this table used to
+		 * name msm-stub-codec.1 here.  A stub has no DAI events, so
+		 * the amplifiers were never taken out of power down: reading
+		 * the chip showed SYSCTRL (0x04) stuck at 0x4003 - PWDN and
+		 * AMPPD set - through every playback, and the speaker stayed
+		 * silent even after the PCM started without error.
+		 */
+		.num_codecs = ARRAY_SIZE(awinic_codecs),
+		.codecs = awinic_codecs,
+#else
 		.codec_name = "msm-stub-codec.1",
 		.codec_dai_name = "msm-stub-rx",
+#endif
 		.no_pcm = 1,
 		.dpcm_playback = 1,
 		.id = MSM_BACKEND_DAI_TERTIARY_MI2S_RX,
