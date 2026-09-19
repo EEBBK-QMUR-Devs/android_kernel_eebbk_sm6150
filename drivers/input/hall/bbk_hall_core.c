@@ -569,14 +569,21 @@ static void bbk_hal_work_func(struct work_struct *work)
 			hall_core_reset_queues();
 			vib_update_key(635);
 		} else if (queue_data_is_move_strong_press(d->move_queue, state,
-							   polarity)) {
-			if (d->move_queue->count >= 14) {
-				pr_info("[LYQ-damon-hall]:damon mechanism pushed by hand, abort\n");
-				hall_core_reset_queues();
-				cancel_vib_hrtimer(0);
-			} else {
-				cancel_vib_hrtimer(1);
-			}
+							   polarity) &&
+			   d->move_queue->count >= d->move_queue->size &&
+			   queue_data_is_move_press(d->move_queue)) {
+			/*
+			 * The divergence criterion on its own fires on a healthy
+			 * move: the up/down difference changes by far more than
+			 * 30 counts while the module travels, which aborted the
+			 * elevator after a few hundred milliseconds ("stopped
+			 * half way").  Only stop when the mechanism really has
+			 * stopped - a hand push or a blockage stalls it, while a
+			 * healthy move keeps both channels changing.
+			 */
+			pr_info("[LYQ-damon-hall]:damon mechanism blocked, abort\n");
+			hall_core_reset_queues();
+			cancel_vib_hrtimer(0);
 		}
 	}
 
