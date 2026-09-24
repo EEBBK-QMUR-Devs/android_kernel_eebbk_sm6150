@@ -622,13 +622,43 @@ static int aw_pid_2032_dev_init(struct aw882xx *aw882xx,  int index)
 
 int aw882xx_init(struct aw882xx *aw882xx, int index)
 {
-	if (aw882xx->chip_id == PID_1852_ID) {
-		return aw_pid_1852_dev_init(aw882xx, index);
-	} else if (aw882xx->chip_id == PID_2032_ID) {
-		return aw_pid_2032_dev_init(aw882xx, index);
-	}
+    struct aw_device *aw_pa = NULL;
+    int ret = 0;
 
-	aw_dev_err(aw882xx->dev, "unsupported chip id %d", aw882xx->chip_id);
-	return -EINVAL;
+    if (aw882xx->chip_id == PID_1852_ID) {
+        ret = aw_pid_1852_dev_init(aw882xx, index);
+    } else if (aw882xx->chip_id == PID_2032_ID) {
+        ret = aw_pid_2032_dev_init(aw882xx, index);
+    } else {
+        aw_dev_err(aw882xx->dev, "unsupported chip id %d", aw882xx->chip_id);
+        return -EINVAL;
+    }
+    if (ret)
+        return ret;
+
+    aw_pa = aw882xx->aw_pa;
+
+    /* 强制覆盖 acf_name 和 monitor_name */
+    switch (aw882xx->i2c->addr) {
+    case 0x34:
+        snprintf(aw_pa->acf_name, AW_NAME_MAX, "aw882xx_spk_reg_l.bin");
+        break;
+    case 0x35:
+        snprintf(aw_pa->acf_name, AW_NAME_MAX, "aw882xx_spk_reg_r.bin");
+        break;
+    case 0x36:
+        snprintf(aw_pa->acf_name, AW_NAME_MAX, "aw882xx_rcv_reg_l.bin");
+        break;
+    case 0x37:
+        snprintf(aw_pa->acf_name, AW_NAME_MAX, "aw882xx_rcv_reg_r.bin");
+        break;
+    default:
+        aw_dev_err(aw882xx->dev, "unknown i2c addr 0x%x", aw882xx->i2c->addr);
+        return -EINVAL;
+    }
+    memset(aw_pa->monitor_name, 0, AW_NAME_MAX); // 禁用 monitor
+
+    return 0;
 }
+
 
