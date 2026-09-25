@@ -114,6 +114,23 @@ static uint32_t  bbk_front_info_size;
 #define BBK_FRONT_OV16A10(vendor) \
 	"Module Vendor: " vendor " %s, Image Sensor: " \
 	"OmniVision ov16a10(16M)(FF)(RAW)(MIPI)\n"
+#ifdef CONFIG_MACH_EEBBK_P22NH220
+/*
+ * T3FIX_FRONT_OV8856: the T3 (P22NH220) front module is an OmniVision
+ * OV8856.  The vendor CamX HAL only ships
+ *   /vendor/lib64/camera/com.qti.sensor.ov8856.so
+ *   /vendor/lib64/camera/com.qti.sensormodule.tsp_ov8856.bin
+ *   /vendor/lib64/camera/com.qti.eeprom.tsp_p24c64g_ov8856.so
+ * and the factory kernel reports "Module Vendor: TSP, Image Sensor:
+ * OmniVision ov8856(8M)" for this very module, which is what makes CamX
+ * match tsp_ov8856.bin and enumerate the front camera.  Reporting ov16a10
+ * made every sensormodule bin fail its vendor check, so only the rear
+ * camera ever reached the camera provider.
+ */
+#define BBK_FRONT_OV8856(vendor) \
+	"Module Vendor: " vendor " %s, Image Sensor: " \
+	"OmniVision ov8856(8M)(FF)(RAW)(MIPI)\n"
+#endif
 #define BBK_FRONT_H110_OV16A10(vendor) \
 	"H110 Module Vendor: " vendor " %s, Image Sensor: " \
 	"OmniVision ov16a10(16M)(FF)(RAW)(MIPI)\n"
@@ -235,7 +252,11 @@ static const char *bbk_back_info_vendor(uint8_t *buf, uint32_t len)
 static const char *bbk_front_info_vendor(uint8_t *buf, uint32_t len)
 {
 	if (!len)
+	    #ifdef CONFIG_MACH_EEBBK_P22NH220
+	    return BBK_FRONT_OV8856("TSP");
+	    #else
 		return BBK_FRONT_OV16A10("TSP");
+		#endif
 
 	if (buf[0] == 0xa0) {			/* H110 / TSP ov16a10 */
 		if (len <= 1)
@@ -258,7 +279,11 @@ static const char *bbk_front_info_vendor(uint8_t *buf, uint32_t len)
 		return BBK_FRONT_S5K4H7("unknown");
 
 	if (len <= 1)
+	    #ifdef CONFIG_MACH_EEBBK_P22NH220
+	    return BBK_FRONT_OV8856("TSP");
+	    #else
 		return BBK_FRONT_OV16A10("TSP");
+		#endif
 
 	if (buf[1] == 0x06) {			/* Q Tech ov16a10 */
 		if (len < 8)
@@ -275,18 +300,38 @@ static const char *bbk_front_info_vendor(uint8_t *buf, uint32_t len)
 		}
 	} else if (buf[1] == 0x0a) {		/* TSP ov16a10 */
 		if (len < 7)
+		    #ifdef CONFIG_MACH_EEBBK_P22NH220
+		    return BBK_FRONT_OV8856("TSP");
+		    #else
 			return BBK_FRONT_OV16A10("TSP");
+			#endif
 		if (!buf[6]) {
 			if (len < 8)
+			    #ifdef CONFIG_MACH_EEBBK_P22NH220
+			    return BBK_FRONT_OV8856("TSP");
+			    #else
 				return BBK_FRONT_OV16A10("TSP");
+				#endif
 			if (!buf[7]) {
 				if (len < 9)
+				    #ifdef CONFIG_MACH_EEBBK_P22NH220
+				    return BBK_FRONT_OV8856("TSP");
+				    #else
 					return BBK_FRONT_OV16A10("TSP");
+					#endif
 				if (!buf[8]) {
 					if (len < 10)
+					    #ifdef CONFIG_MACH_EEBBK_P22NH220
+					    return BBK_FRONT_OV8856("TSP");
+					    #else
 						return BBK_FRONT_OV16A10("TSP");
+						#endif
 					if (!buf[9])
+					    #ifdef CONFIG_MACH_EEBBK_P22NH220
+					    return BBK_FRONT_OV8856("TSP");
+					    #else
 						return BBK_FRONT_OV16A10("TSP");
+						#endif
 				}
 			}
 		}
