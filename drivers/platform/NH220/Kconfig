@@ -1,0 +1,4 @@
+config MACH_EEBBK_P22NH220
+	tristate "Support for EEBBK P22NH220 (T1/T3)."
+	help
+	  Enable the support for EEBBK P22NH220 (T1/T3).
