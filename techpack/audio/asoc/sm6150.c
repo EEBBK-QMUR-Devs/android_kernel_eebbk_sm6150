@@ -7798,6 +7798,11 @@ static struct snd_soc_dai_link msm_mi2s_be_dai_links[] = {
 		.stream_name = "Tertiary MI2S Playback",
 		.cpu_dai_name = "msm-dai-q6-mi2s.2",
 		.platform_name = "msm-pcm-routing",
+#ifdef CONFIG_MACH_EEBBK_P22NH220
+		/* EEBBK T3: drive the dual TFA9894 amps instead of a stub codec */
+		.num_codecs = ARRAY_SIZE(t3_tfa98xx_codecs),
+		.codecs = t3_tfa98xx_codecs,
+#else
 #ifdef CONFIG_SND_SOC_AWINIC_AW882XX
 		/*
 		 * EEBBK S6 (P20H130): the speaker is driven by the two AWINIC
@@ -7813,11 +7818,6 @@ static struct snd_soc_dai_link msm_mi2s_be_dai_links[] = {
 		 */
 		.num_codecs = ARRAY_SIZE(awinic_codecs),
 		.codecs = awinic_codecs,
-#else
-#ifdef CONFIG_MACH_EEBBK_P22NH220
-		/* EEBBK T3: drive the dual TFA9894 amps instead of a stub codec */
-		.num_codecs = ARRAY_SIZE(t3_tfa98xx_codecs),
-		.codecs = t3_tfa98xx_codecs,
 #else
 		.codec_name = "msm-stub-codec.1",
 		.codec_dai_name = "msm-stub-rx",
