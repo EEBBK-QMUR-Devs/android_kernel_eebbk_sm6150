@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Novatek NT36xxx touchscreen driver configuration
+#
+config TOUCHSCREEN_NT36XXX
+	bool "Novatek NT36xxx"
+	default n
+	---help---
+	  NOTE (EEBBK T3 / P22NH220): keep this DISABLED.  The T3 panel node
+	  "novatek@62" on i2c-1 is a phantom entry (the T3 ships a FocalTech
+	  FT8719 at 1-0038) and this driver's .shutdown callback dereferences a
+	  NULL tfa/ts pointer, oopsing inside device_shutdown() (Process init,
+	  pc : nvt_ts_shutdown+0x60).  That aborts the restart sequence and the
+	  bootloader then falls back to QMMI/DIAG -> Windows shows
+	  "Qualcomm HS-USB Diagnostics 900E" and the reboot takes ~100 s.
+	help
+	  Say Y here if you have a Novatek NT36xxx touchscreen connected
+	  to your system.
+
+	  If unsure, say N.
