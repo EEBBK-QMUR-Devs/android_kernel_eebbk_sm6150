@@ -1,4 +1,4 @@
-name: Build kernel
+name: Build kernel for H130
 on:
   workflow_call:
   workflow_dispatch:
