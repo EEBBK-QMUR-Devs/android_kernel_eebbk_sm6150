@@ -3040,7 +3040,15 @@ enum tfa_error tfa_dev_start(struct tfa_device *tfa, int next_profile, int vstep
 	} else {
 		/* Check if we need coldstart or ACS is set */
 		err = show_current_state(tfa);
-		err = tfaRunSpeakerBoost(tfa, 0, next_profile);
+		/*
+		 * T3FIX_COLDSTART: tfa_dev_stop() does not restore the TFA98xx ACS
+		 * bit, so every playback after the first is treated as a "warmstart"
+		 * and tfaRunSpeakerStartup() (DSP patch + profile download) is
+		 * skipped -> the amplifier runs but stays silent.
+		 * force=1 runs tfaRunColdStartup(), which sets ACS, matching what the
+		 * factory kernel does on every playback.
+		 */
+		err = tfaRunSpeakerBoost(tfa, 1, next_profile);
 		if ( err != Tfa98xx_Error_Ok) {
 			pr_err("RunSpeakerBoost failed  %d\n", err);
 			goto error_exit;

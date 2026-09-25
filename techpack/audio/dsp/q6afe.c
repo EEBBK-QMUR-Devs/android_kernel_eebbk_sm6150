@@ -8954,6 +8954,12 @@ int send_tfa_cal_in_band(void *buf, int cmd_size)
 {
 	union afe_spkr_prot_config afe_spk_config;
 	int32_t port_id = AFE_PORT_ID_TFADSP_RX;
+#ifdef CONFIG_MACH_EEBBK_P22NH220	
+	/* T3FIX_SKIPCAL: ADSP rejects AFE_PARAM_ID_TFADSP_RX_CFG (EBADPARAM) on this
+	 * tree - tfa98xx v6.5.2 vs vendor v6.7.4 param layout.  Skipping avoids
+	 * leaving the AFE port in a bad state on the next amp start. */
+	return 0;
+#endif
 
 	if (cmd_size > sizeof(afe_spk_config))
 		return -EINVAL;

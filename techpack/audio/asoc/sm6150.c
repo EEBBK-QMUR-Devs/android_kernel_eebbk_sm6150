@@ -7701,6 +7701,20 @@ static struct snd_soc_dai_link ext_disp_be_dai_link[] = {
 	},
 };
 
+#ifdef CONFIG_MACH_EEBBK_P22NH220
+/* EEBBK T3: dual NXP TFA9894 smart amplifiers on i2c bus 2 (2-0034 / 2-0036) */
+static struct snd_soc_dai_link_component t3_tfa98xx_codecs[] = {
+	{
+		.name = "tfa98xx.2-0034",
+		.dai_name = "tfa98xx-aif-2-34",
+	},
+	{
+		.name = "tfa98xx.2-0036",
+		.dai_name = "tfa98xx-aif-2-36",
+	},
+};
+#endif
+
 static struct snd_soc_dai_link msm_mi2s_be_dai_links[] = {
 	{
 		.name = LPASS_BE_PRI_MI2S_RX,
@@ -7800,8 +7814,14 @@ static struct snd_soc_dai_link msm_mi2s_be_dai_links[] = {
 		.num_codecs = ARRAY_SIZE(awinic_codecs),
 		.codecs = awinic_codecs,
 #else
+#ifdef CONFIG_MACH_EEBBK_P22NH220
+		/* EEBBK T3: drive the dual TFA9894 amps instead of a stub codec */
+		.num_codecs = ARRAY_SIZE(t3_tfa98xx_codecs),
+		.codecs = t3_tfa98xx_codecs,
+#else
 		.codec_name = "msm-stub-codec.1",
 		.codec_dai_name = "msm-stub-rx",
+#endif
 #endif
 		.no_pcm = 1,
 		.dpcm_playback = 1,
