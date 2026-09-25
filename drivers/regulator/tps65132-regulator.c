@@ -268,9 +268,20 @@ static const struct i2c_device_id tps65132_id[] = {
 };
 MODULE_DEVICE_TABLE(i2c, tps65132_id);
 
+/* T3FIX_TPS: the EEBBK T3 panel node is "ti65132s@3e" with
+ * compatible = "ti,ti65132"; the upstream driver had no of_match so it
+ * could never bind to it and the LCD bias rails never came up. */
+static const struct of_device_id tps65132_of_match[] = {
+	{ .compatible = "ti,ti65132", },
+	{ .compatible = "ti,tps65132", },
+	{ },
+};
+MODULE_DEVICE_TABLE(of, tps65132_of_match);
+
 static struct i2c_driver tps65132_i2c_driver = {
 	.driver = {
 		.name = "tps65132",
+		.of_match_table = tps65132_of_match,
 	},
 	.probe = tps65132_probe,
 	.id_table = tps65132_id,
