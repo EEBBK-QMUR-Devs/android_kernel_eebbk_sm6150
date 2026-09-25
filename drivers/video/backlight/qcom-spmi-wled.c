@@ -2301,6 +2301,28 @@ static int wled_configure(struct wled *wled, struct device *dev)
 		if (of_property_read_bool(dev->of_node, bool_opts[i].name))
 			*bool_opts[i].val_ptr = true;
 	}
+	
+    #ifdef CONFIG_MACH_EEBBK_P22NH220	
+	if (is_wled5(wled)) {
+		/*
+		 * T3FIX_STRINGS: the T3 (P22NH220) panel is a 4-string backlight.  Its
+		 * dtbo overlay (fragment@33) carries "qcom,string-cfg = <3>", which this
+		 * driver consumes as a sink bitmask, so only 2 of the 4 current sinks
+		 * were enabled (sink_en = 0x30) and the panel never reached its full
+		 * brightness - roughly half of what the factory firmware produces.
+		 *
+		 * The factory kernel ends up with all four sinks enabled; its boot log
+		 * reads  WLED: wled_configure: qcom,string-cfg = 3   followed by
+		 *       WLED: wled_configure: qcom,string-cfg = 15
+		 * i.e. it treats the DT value as a 0-based string index rather than as a
+		 * mask (index 3 -> 4 strings -> 0xf).  Reproduce that behaviour.
+		 */
+		if (wled->cfg.string_cfg != 0xf) {
+			pr_err("WLED: T3FIX_STRINGS string-cfg 0x%x -> 0xf (4 LED strings)", wled->cfg.string_cfg);
+			wled->cfg.string_cfg = 0xf;
+		}
+	}
+    #endif
 
 	wled->sc_irq = platform_get_irq_byname(wled->pdev, "sc-irq");
 	if (wled->sc_irq < 0)
