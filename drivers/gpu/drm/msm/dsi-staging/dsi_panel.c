@@ -3188,9 +3188,16 @@ static int dsi_panel_parse_esd_config(struct dsi_panel *panel)
 	u8 *esd_mode = NULL;
 
 	esd_config = &panel->esd_config;
+    #ifdef CONFIG_MACH_EEBBK_P22NH220
+	/* T3FIX_ESD: this vendor panel has no working "qcom,mdss-dsi-panel-status-*"
+	 * register set for our tree; the register_read check always fails and the
+	 * driver resets the panel every ~5s (black -> relight).  Disable it. */
+	esd_config->esd_enabled = false;
+    #else
 	esd_config->status_mode = ESD_MODE_MAX;
 	esd_config->esd_enabled = utils->read_bool(utils->data,
 		"qcom,esd-check-enabled");
+	#endif
 
 	if (!esd_config->esd_enabled)
 		return 0;
